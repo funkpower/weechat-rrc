@@ -185,9 +185,35 @@ test_text(void)
     CHECK(rrc_normalize_room("   ", out, sizeof(out)) == 0, "empty room");
 }
 
+static int noop_send(void *ctx, const uint8_t *p, size_t n) { return 0; }
+
+static void
+test_keepalive_not_deduplicated(void)
+{
+    struct rns_identity id;
+    struct rns_client c;
+    struct rns_callbacks cb = { noop_send, NULL, NULL, NULL };
+    uint8_t pkt[RNS_HEADER_MINSIZE + 1];
+
+    rns_identity_from_bytes(&id, V_ID_PRV);
+    rns_client_init(&c, &id, V_HUB_DEST, 0, &cb, NULL);
+    c.state = RNS_ACTIVE;
+    memset(c.link_id, 0xab, RNS_HASH_LEN);
+    pkt[0] = 0x0c;   /* HEADER_1, LINK, DATA */
+    pkt[1] = 0;
+    memcpy(pkt + 2, c.link_id, RNS_HASH_LEN);
+    pkt[18] = RNS_CTX_KEEPALIVE;
+    pkt[19] = 0xfe;
+    rns_client_inbound(&c, pkt, sizeof(pkt), 100.0);
+    CHECK(c.last_inbound == 100.0, "first keepalive counts as inbound");
+    rns_client_inbound(&c, pkt, sizeof(pkt), 200.0);
+    CHECK(c.last_inbound == 200.0, "an identical later keepalive counts too");
+}
+
 int
 main(void)
 {
+    test_keepalive_not_deduplicated();
     test_identity();
     test_kdf_and_token();
     test_cbor();

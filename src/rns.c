@@ -319,6 +319,21 @@ seen_before(struct rns_client *c, const struct rns_packet *p)
     return 0;
 }
 
+static int
+exempt_from_dedup(const struct rns_packet *p)
+{
+    switch (p->context) {
+    case RNS_CTX_KEEPALIVE:
+    case RNS_CTX_RESOURCE:
+    case 0x03:  /* RESOURCE_REQ */
+    case 0x05:  /* RESOURCE_PRF */
+    case 0x08:  /* CACHE_REQUEST */
+    case 0x0e:  /* CHANNEL */
+        return 1;
+    }
+    return 0;
+}
+
 /* ---- client ---- */
 
 static void
@@ -666,7 +681,9 @@ rns_client_inbound(struct rns_client *c, const uint8_t *raw, size_t len, double 
     if (rns_packet_parse(raw, len, &p) != 0)
         return;
     c->rx_packets++;
-    if (seen_before(c, &p))
+    /* As Transport.packet_filter(): keepalives repeat byte for byte, and so
+     * can resource and channel packets, so they are never duplicates. */
+    if (!exempt_from_dedup(&p) && seen_before(c, &p))
         return;
     p.hops++;   /* as Transport.inbound(): count the hop to us */
 
