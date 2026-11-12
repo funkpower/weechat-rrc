@@ -42,6 +42,7 @@
 #define RRC_K_ROOM 5
 #define RRC_K_BODY 6
 #define RRC_K_NICK 7
+#define RRC_K_DST 8   /* rrcd extension: direct NOTICE to one identity */
 
 #define RRC_MAX_NICK 64
 #define RRC_MAX_ROOM 128
@@ -66,6 +67,7 @@ enum rrc_event_type {
     RRC_EV_ERROR,
     RRC_EV_PONG,
     RRC_EV_HELLO_TIMEOUT,
+    RRC_EV_DIRECT,          /* a NOTICE addressed to us alone (rrcd K_DST) */
 };
 
 /* Every string is NUL-terminated, valid UTF-8, and free of control
@@ -113,6 +115,7 @@ struct rrc_session {
     double hello_sent;
     double hello_interval;
     char hub_name[RRC_MAX_NICK];
+    int hub_direct;             /* the hub forwards direct NOTICEs */
     struct rrc_limits limits;
 
     uint8_t sent_ids[RRC_SENT_IDS][8];
@@ -148,6 +151,11 @@ int rrc_part(struct rrc_session *s, const char *room, double now, const char **e
 int rrc_say(struct rrc_session *s, int type, const char *room, const char *text,
             double now, const char **err);
 int rrc_ping(struct rrc_session *s, double now, const char **err);
+/* A NOTICE to one identity (full hash), on hubs that offer it. */
+int rrc_direct(struct rrc_session *s, const uint8_t dst[RNS_HASH_LEN], const char *text,
+               double now, const char **err);
+/* Largest body of a direct message. */
+size_t rrc_max_direct(struct rrc_session *s);
 void rrc_set_nick(struct rrc_session *s, const char *nick);
 
 /* Largest body (in bytes) a message to this room can carry right now. */

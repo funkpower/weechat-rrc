@@ -37,6 +37,8 @@
 #define L_RATE 4
 /* capabilities */
 #define CAP_ACTION 1
+#define CAP_DIRECT_NOTICE 2
+#define B_WELCOME_CAPS 2
 
 #define HELLO_MAX_TRIES 5
 #define DECODE_POOL 512
@@ -215,9 +217,22 @@ rrc_max_body(struct rrc_session *s, const char *room)
 enum body_kind { BODY_NONE, BODY_TEXT, BODY_RAW, BODY_HELLO };
 
 static void
+put_envelope_to(struct rrc_session *s, struct cb_writer *w, int type, const char *room,
+                const uint8_t *dst, enum body_kind kind, const void *body, size_t body_len,
+                int with_nick, uint8_t id_out[8]);
+
+static void
 put_envelope(struct rrc_session *s, struct cb_writer *w, int type, const char *room,
              enum body_kind kind, const void *body, size_t body_len, int with_nick,
              uint8_t id_out[8])
+{
+    put_envelope_to(s, w, type, room, NULL, kind, body, body_len, with_nick, id_out);
+}
+
+static void
+put_envelope_to(struct rrc_session *s, struct cb_writer *w, int type, const char *room,
+                const uint8_t *dst, enum body_kind kind, const void *body, size_t body_len,
+                int with_nick, uint8_t id_out[8])
 {
     uint8_t id[8];
     struct timespec ts;
@@ -234,6 +249,8 @@ put_envelope(struct rrc_session *s, struct cb_writer *w, int type, const char *r
     if (kind != BODY_NONE)
         fields++;
     if (nick)
+        fields++;
+    if (dst)
         fields++;
     cb_put_map(w, fields);
     cb_put_uint(w, RRC_K_V);
@@ -277,6 +294,10 @@ put_envelope(struct rrc_session *s, struct cb_writer *w, int type, const char *r
     if (nick) {
         cb_put_uint(w, RRC_K_NICK);
         cb_put_text(w, s->nick, strlen(s->nick));
+    }
+    if (dst) {
+        cb_put_uint(w, RRC_K_DST);
+        cb_put_bytes(w, dst, RNS_HASH_LEN);
     }
     if (id_out)
         memcpy(id_out, id, sizeof(id));
@@ -568,6 +589,40 @@ rrc_say(struct rrc_session *s, int type, const char *room, const char *text,
     return 0;
 }
 
+size_t
+rrc_max_direct(struct rrc_session *s)
+{
+    size_t max = rrc_max_body(s, NULL);
+
+    /* the destination field: key, byte-string head, 16 bytes */
+    return max > 18 + 3 ? max - 18 : 0;
+}
+
+int
+rrc_direct(struct rrc_session *s, const uint8_t dst[RNS_HASH_LEN], const char *text,
+           double now, const char **err)
+{
+    uint8_t buf[RNS_LINK_MDU];
+    struct cb_writer w;
+    size_t len = strlen(text);
+
+    if (!s->hub_direct) {
+        *err = "this hub doesn't forward direct messages";
+        return -1;
+    }
+    if (!len) {
+        *err = "empty message";
+        return -1;
+    }
+    if (len > rrc_max_direct(s)) {
+        *err = "message too long";
+        return -1;
+    }
+    cb_writer_init(&w, buf, sizeof(buf));
+    put_envelope_to(s, &w, RRC_T_NOTICE, NULL, dst, BODY_TEXT, text, len, 1, NULL);
+    return enqueue(s, &w, now, err);
+}
+
 int
 rrc_ping(struct rrc_session *s, double now, const char **err)
 {
@@ -670,6 +725,9 @@ rrc_session_data(struct rrc_session *s, const uint8_t *data, size_t len, double 
         s->hello_tries = 0;
         if (body && body->type == CB_MAP) {
             const struct cb_item *lim = cb_map_uint(body, B_WELCOME_LIMITS);
+            const struct cb_item *caps = cb_map_uint(body, B_WELCOME_CAPS);
+            const struct cb_item *dn = cb_map_uint(caps, CAP_DIRECT_NOTICE);
+            s->hub_direct = dn && dn->type == CB_BOOL && dn->u;
             item_line(cb_map_uint(body, B_WELCOME_HUB), hub_s, sizeof(hub_s));
             item_line(cb_map_uint(body, B_WELCOME_VER), ver_s, sizeof(ver_s));
             if (hub_s[0])
@@ -732,6 +790,13 @@ rrc_session_data(struct rrc_session *s, const uint8_t *data, size_t len, double 
         ev.text = text_s;
         ev.type = t->u == RRC_T_MSG ? RRC_EV_MSG
                 : t->u == RRC_T_ACTION ? RRC_EV_ACTION : RRC_EV_NOTICE;
+        {
+            const struct cb_item *dst = cb_map_uint(env, RRC_K_DST);
+            if (t->u == RRC_T_NOTICE && dst && dst->type == CB_BYTES
+                && dst->len == RNS_HASH_LEN && memcmp(dst->p, s->self, RNS_HASH_LEN) == 0
+                && ev.src && !ev.room)
+                ev.type = RRC_EV_DIRECT;
+        }
         s->cb.event(s->ctx, &ev);
         return;
 

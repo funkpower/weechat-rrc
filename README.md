@@ -157,7 +157,8 @@ The address is the argument after the hub in `/rrc add`, or `rrc.server.<name>.a
 ```
 
 If the link drops, the plugin reconnects, waiting longer after each failure, and rejoins the
-rooms that are open.
+rooms that are open. A JOIN the hub doesn't answer (a packet lost on the way) is sent again,
+up to three times.
 
 ## Commands
 
@@ -176,8 +177,8 @@ rooms that are open.
 
 ## In rooms
 
-`/join`, `/part`, `/me` and `/nick` work as they do on IRC. A room's topic is its buffer
-title.
+`/join`, `/part`, `/me`, `/nick`, `/msg` and `/query` work as they do on IRC. A room's topic is
+its buffer title.
 
 Rooms on `rrcd` hubs, Permanet Chat among them, have operators, modes and topics, run by the
 hub's own commands. They work with one slash in RRC buffers, and in a room buffer the room is
@@ -199,6 +200,22 @@ work the same way.
 
 Hub notices are shown as `--` lines. A notice someone else sent to the room is shown with their
 name, `-nick-`, and is never taken for the hub's own word (a topic change, a member list).
+
+## Direct messages
+
+```
+/msg nick text
+/query nick
+```
+
+work in any RRC buffer on hubs that forward direct messages (`rrcd` does; Permanet Chat does).
+A conversation has its own buffer, and a message to you opens one. People are found by the nick
+they used in a room on that hub, or by their 32-character identity hash. If two identities use
+the same nick, give the hash (`/who` shows the start of it). The hub delivers a direct message
+only while the other person is connected; there is no store and forward.
+
+The plugin remembers the nick each identity last used, in `${weechat_data_dir}/rrc/nicks`, so
+someone who speaks without a nick still shows by name and `/msg` finds people you have seen.
 
 ## Colour
 
@@ -287,7 +304,6 @@ the room to list the hub's rooms.
 
 ## Limits
 
-- No direct messages between users yet.
 - Reticulum resource transfers are not supported, so what a hub sends as a resource (a long
   MOTD, a `/who` reply for a busy room) does not arrive.
 - Your own lines show when they are queued, not when the hub has accepted them.

@@ -58,8 +58,18 @@ struct rrc_room {
     struct t_gui_buffer *buffer;
     int joined;
     int who_pending;
+    double join_sent;           /* when our JOIN went, for the retry */
+    int join_tries;             /* JOINs sent without an answer; 0: none pending */
     struct rrc_member *members;
     struct rrc_room *next;
+};
+
+/* A private conversation (rrcd direct NOTICEs) with one identity. */
+struct rrc_query {
+    uint8_t hash[RNS_HASH_LEN];
+    char nick[RRC_MAX_NICK];
+    struct t_gui_buffer *buffer;
+    struct rrc_query *next;
 };
 
 enum conn_state { CONN_IDLE, CONN_CONNECTING, CONN_UP };
@@ -91,6 +101,7 @@ struct rrc_server {
     int reconnect_delay;
 
     struct rrc_room *rooms;
+    struct rrc_query *queries;
     struct rrc_server *next;
 };
 
@@ -294,6 +305,156 @@ room_find(struct rrc_server *s, const char *name)
     return NULL;
 }
 
+/* ---- nick cache ----
+ * The nick each identity last used, kept across sessions in
+ * ${weechat_data_dir}/rrc/nicks, so someone who speaks without a nick (or
+ * whose nick isn't in a /who yet) still shows by name, and /msg can find
+ * people seen in any room. Nicks are advisory: this is a display aid. */
+
+#define NICK_CACHE_MAX 4096
+
+struct nick_entry {
+    uint8_t hash[RNS_HASH_LEN];
+    char nick[RRC_MAX_NICK];
+};
+
+static struct nick_entry *nick_cache = NULL;
+static size_t nick_cache_len = 0, nick_cache_next = 0;
+static int nick_cache_dirty = 0;
+static double nick_cache_saved = 0;   /* when it was last written */
+
+static char *
+nick_cache_path(void)
+{
+    char *dir = weechat_string_eval_path_home("${weechat_data_dir}/rrc", NULL, NULL, NULL);
+    char *path;
+
+    if (!dir)
+        return NULL;
+    path = malloc(strlen(dir) + 8);
+    if (path)
+        sprintf(path, "%s/nicks", dir);
+    weechat_mkdir_parents(dir, 0700);
+    free(dir);
+    return path;
+}
+
+static const char *
+nick_cache_get(const uint8_t *hash)
+{
+    size_t i;
+
+    for (i = 0; i < nick_cache_len; i++)
+        if (memcmp(nick_cache[i].hash, hash, RNS_HASH_LEN) == 0)
+            return nick_cache[i].nick;
+    return NULL;
+}
+
+static void
+nick_cache_learn(const uint8_t *hash, const char *nick)
+{
+    size_t i;
+
+    if (!hash || !nick || !nick[0] || !nick_cache)
+        return;
+    for (i = 0; i < nick_cache_len; i++) {
+        if (memcmp(nick_cache[i].hash, hash, RNS_HASH_LEN) == 0) {
+            if (strcmp(nick_cache[i].nick, nick) != 0) {
+                snprintf(nick_cache[i].nick, sizeof(nick_cache[i].nick), "%s", nick);
+                nick_cache_dirty = 1;
+            }
+            return;
+        }
+    }
+    /* full: replace the oldest-added entry */
+    i = nick_cache_len < NICK_CACHE_MAX ? nick_cache_len++ : nick_cache_next++ % NICK_CACHE_MAX;
+    memcpy(nick_cache[i].hash, hash, RNS_HASH_LEN);
+    snprintf(nick_cache[i].nick, sizeof(nick_cache[i].nick), "%s", nick);
+    nick_cache_dirty = 1;
+}
+
+static void
+nick_cache_load(void)
+{
+    char *path = nick_cache_path(), line[256], *sp, *nl;
+    uint8_t hash[RNS_HASH_LEN];
+    FILE *f;
+
+    nick_cache = calloc(NICK_CACHE_MAX, sizeof(*nick_cache));
+    if (!path || !nick_cache) {
+        free(path);
+        return;
+    }
+    f = fopen(path, "r");
+    free(path);
+    if (!f)
+        return;
+    while (fgets(line, sizeof(line), f)) {
+        nl = strchr(line, '\n');
+        if (nl)
+            *nl = '\0';
+        sp = strchr(line, ' ');
+        if (!sp)
+            continue;
+        *sp = '\0';
+        if (rns_unhex(line, hash, RNS_HASH_LEN) == 0)
+            nick_cache_learn(hash, sp + 1);
+    }
+    fclose(f);
+    nick_cache_dirty = 0;
+}
+
+static void
+nick_cache_save(void)
+{
+    char *path, *tmp, hex[2 * RNS_HASH_LEN + 1];
+    size_t i;
+    FILE *f;
+    int fd;
+
+    if (!nick_cache || !nick_cache_dirty)
+        return;
+    path = nick_cache_path();
+    if (!path)
+        return;
+    tmp = malloc(strlen(path) + 5);
+    if (!tmp) {
+        free(path);
+        return;
+    }
+    sprintf(tmp, "%s.new", path);
+    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    f = fd >= 0 ? fdopen(fd, "w") : NULL;
+    if (f) {
+        for (i = 0; i < nick_cache_len; i++) {
+            rns_hex(nick_cache[i].hash, RNS_HASH_LEN, hex);
+            fprintf(f, "%s %s\n", hex, nick_cache[i].nick);
+        }
+        if (fclose(f) == 0 && rename(tmp, path) == 0)
+            nick_cache_dirty = 0;
+    } else if (fd >= 0) {
+        close(fd);
+    }
+    free(tmp);
+    free(path);
+}
+
+static struct rrc_query *
+query_of_buffer(struct t_gui_buffer *buffer, struct rrc_server **server_out)
+{
+    struct rrc_server *s;
+    struct rrc_query *q;
+
+    for (s = servers; s; s = s->next)
+        for (q = s->queries; q; q = q->next)
+            if (q->buffer == buffer) {
+                if (server_out)
+                    *server_out = s;
+                return q;
+            }
+    return NULL;
+}
+
 /* The server and room behind a buffer (room may be NULL). */
 static struct rrc_server *
 buffer_context(struct t_gui_buffer *buffer, struct rrc_room **room_out)
@@ -314,6 +475,8 @@ buffer_context(struct t_gui_buffer *buffer, struct rrc_room **room_out)
             }
         }
     }
+    if (query_of_buffer(buffer, &s))
+        return s;
     return NULL;
 }
 
@@ -475,6 +638,10 @@ member_upsert(struct rrc_room *r, const uint8_t *hash, size_t len, const char *n
     }
     if (nick && nick[0])
         snprintf(m->nick, sizeof(m->nick), "%s", nick);
+    else if (!m->nick[0] && m->hash_len == RNS_HASH_LEN && nick_cache_get(m->hash))
+        snprintf(m->nick, sizeof(m->nick), "%s", nick_cache_get(m->hash));
+    if (nick && nick[0] && m->hash_len == RNS_HASH_LEN)
+        nick_cache_learn(m->hash, nick);
     nicklist_sync(r, m);
     return m;
 }
@@ -521,13 +688,19 @@ sender_name(struct rrc_room *r, const struct rrc_event *ev, char *out, size_t si
     char hex[HEX_SHORT + 1];
 
     if (ev->nick) {
+        if (ev->src)
+            nick_cache_learn(ev->src, ev->nick);
         snprintf(out, size, "%s", ev->nick);
         return;
     }
     if (r && ev->src)
         m = member_find(r, ev->src, RNS_HASH_LEN, NULL);
-    if (m) {
+    if (m && m->nick[0]) {
         member_display(m, out, size);
+        return;
+    }
+    if (ev->src && nick_cache_get(ev->src)) {
+        snprintf(out, size, "%s", nick_cache_get(ev->src));
         return;
     }
     if (ev->src) {
@@ -813,6 +986,24 @@ link_data_cb(void *ctx, const uint8_t *data, size_t len)
 
 /* ---- RRC events ---- */
 
+static struct rrc_query *query_open(struct rrc_server *s, const uint8_t *hash,
+                                    const char *nick, int switch_to);
+static void query_free(struct rrc_server *s, struct rrc_query *q);
+static void query_print(struct rrc_server *s, struct rrc_query *q, const char *nick,
+                        const char *text, int own);
+
+/* Send a JOIN and remember it, so the timer can send it again when no
+ * answer comes (a lost packet on a lossy link). */
+static int
+room_join(struct rrc_server *s, struct rrc_room *r, const char **err)
+{
+    if (rrc_join(&s->session, r->name, now_s(), err) != 0)
+        return -1;
+    r->join_sent = now_s();
+    r->join_tries++;
+    return 0;
+}
+
 static void
 join_rooms(struct rrc_server *s)
 {
@@ -823,9 +1014,11 @@ join_rooms(struct rrc_server *s)
     int i, n = 0;
 
     /* rooms already open (a reconnect), then the autojoin list */
-    for (r = s->rooms; r; r = r->next)
-        if (r->buffer && rrc_join(&s->session, r->name, now_s(), &err) != 0)
+    for (r = s->rooms; r; r = r->next) {
+        r->join_tries = 0;
+        if (r->buffer && room_join(s, r, &err) != 0)
             server_print(s, "error", "cannot join %s: %s", r->name, err);
+    }
     list = weechat_string_split(autojoin, ",", NULL,
                                 WEECHAT_STRING_SPLIT_STRIP_LEFT
                                 | WEECHAT_STRING_SPLIT_STRIP_RIGHT
@@ -834,8 +1027,8 @@ join_rooms(struct rrc_server *s)
         char norm[RRC_MAX_ROOM];
         if (!rrc_normalize_room(list[i], norm, sizeof(norm)) || room_find(s, norm))
             continue;
-        room_open(s, norm, 0);
-        if (rrc_join(&s->session, norm, now_s(), &err) != 0)
+        r = room_open(s, norm, 0);
+        if (r && room_join(s, r, &err) != 0)
             server_print(s, "error", "cannot join %s: %s", norm, err);
     }
     weechat_string_free_split(list);
@@ -1014,6 +1207,7 @@ session_event_cb(void *ctx, const struct rrc_event *ev)
             if (!r)
                 break;
             r->joined = 1;
+            r->join_tries = 0;
             members_clear(r);
             member_upsert(r, s->session.self, RNS_HASH_LEN, s->session.nick);
             for (i = 0; i < ev->n_members; i++)
@@ -1096,6 +1290,7 @@ session_event_cb(void *ctx, const struct rrc_event *ev)
          * either way we are not in the room */
         if (r && (ev->own || strncmp(ev->text, "kicked", 6) == 0)) {
             r->joined = 0;
+            r->join_tries = 0;
             members_clear(r);
         }
         print_lines(r && r->buffer ? r->buffer : s->buffer, "rrc_error,log3",
@@ -1105,6 +1300,15 @@ session_event_cb(void *ctx, const struct rrc_event *ev)
     case RRC_EV_PONG:
         server_print(s, "network", "pong from the hub: %.0f ms", ev->rtt_ms);
         break;
+
+    case RRC_EV_DIRECT: {
+        struct rrc_query *q;
+        sender_name(NULL, ev, name, sizeof(name));
+        q = query_open(s, ev->src, ev->nick, 0);
+        if (q && q->buffer)
+            query_print(s, q, name, ev->text, 0);
+        break;
+    }
 
     case RRC_EV_HELLO_TIMEOUT:
         rns_client_close(s->link, now_s(), "the hub did not answer HELLO");
@@ -1402,6 +1606,13 @@ server_free(struct rrc_server *s)
         if (b)
             weechat_buffer_close(b);
     }
+    while (s->queries) {
+        struct t_gui_buffer *b = s->queries->buffer;
+        s->queries->buffer = NULL;
+        query_free(s, s->queries);
+        if (b)
+            weechat_buffer_close(b);
+    }
     for (pp = &servers; *pp; pp = &(*pp)->next) {
         if (*pp == s) {
             *pp = s->next;
@@ -1435,6 +1646,244 @@ servers_from_config(void)
         if (!server_find(name))
             server_new(name);
     }
+}
+
+/* ---- private conversations ---- */
+
+static int query_input_cb(const void *pointer, void *data, struct t_gui_buffer *buffer,
+                          const char *input);
+static int query_close_cb(const void *pointer, void *data, struct t_gui_buffer *buffer);
+
+static struct rrc_query *
+query_find(struct rrc_server *s, const uint8_t *hash)
+{
+    struct rrc_query *q;
+
+    for (q = s->queries; q; q = q->next)
+        if (memcmp(q->hash, hash, RNS_HASH_LEN) == 0)
+            return q;
+    return NULL;
+}
+
+/* The buffer for a conversation with one identity, named by its hash so the
+ * log (and the backlog after a reload) follows the person, not the nick. */
+static struct rrc_query *
+query_open(struct rrc_server *s, const uint8_t *hash, const char *nick, int switch_to)
+{
+    struct rrc_query *q = query_find(s, hash);
+    char name[160], hex[2 * RNS_HASH_LEN + 1];
+
+    if (!q) {
+        q = calloc(1, sizeof(*q));
+        if (!q)
+            return NULL;
+        memcpy(q->hash, hash, RNS_HASH_LEN);
+        q->next = s->queries;
+        s->queries = q;
+    }
+    if (nick && nick[0])
+        snprintf(q->nick, sizeof(q->nick), "%s", nick);
+    else if (!q->nick[0]) {
+        const char *cached = nick_cache_get(hash);
+        if (cached)
+            snprintf(q->nick, sizeof(q->nick), "%s", cached);
+        else
+            short_hash(hash, RNS_HASH_LEN, q->nick);
+    }
+    if (!q->buffer) {
+        rns_hex(hash, RNS_HASH_LEN, hex);
+        snprintf(name, sizeof(name), "%s.q.%s", s->name, hex);
+        q->buffer = weechat_buffer_search(RRC_CONFIG_NAME, name);
+        if (q->buffer) {
+            weechat_buffer_set_pointer(q->buffer, "input_callback", &query_input_cb);
+            weechat_buffer_set_pointer(q->buffer, "close_callback", &query_close_cb);
+        } else {
+            q->buffer = buffer_create(name, q->nick, "private", s->name,
+                                      &query_input_cb, &query_close_cb);
+        }
+        if (!q->buffer)
+            return q;
+        rns_hex(hash, RNS_HASH_LEN, hex);
+        {
+            char title[256];
+            snprintf(title, sizeof(title), "direct messages with %s (%s)", q->nick, hex);
+            weechat_buffer_set(q->buffer, "title", title);
+        }
+        set_nick_localvar(s);
+    }
+    weechat_buffer_set(q->buffer, "short_name", q->nick);
+    weechat_buffer_set(q->buffer, "localvar_set_channel", q->nick);
+    if (switch_to)
+        weechat_buffer_set(q->buffer, "display", "1");
+    return q;
+}
+
+static void
+query_free(struct rrc_server *s, struct rrc_query *q)
+{
+    struct rrc_query **pp;
+
+    for (pp = &s->queries; *pp; pp = &(*pp)->next) {
+        if (*pp == q) {
+            *pp = q->next;
+            break;
+        }
+    }
+    free(q);
+}
+
+static void
+query_print(struct rrc_server *s, struct rrc_query *q, const char *nick, const char *text, int own)
+{
+    char tags[256], prefix[256], tagnick[RRC_MAX_NICK];
+    char *color = own ? NULL : nick_color(nick);
+
+    tag_safe(nick, tagnick, sizeof(tagnick));
+    snprintf(tags, sizeof(tags), own ? "rrc_privmsg,notify_none,self_msg,no_highlight,nick_%s,log1"
+                                     : "rrc_privmsg,notify_private,nick_%s,log1", tagnick);
+    snprintf(prefix, sizeof(prefix), "%s%s%s\t",
+             own ? weechat_color("chat_nick_self") : (color ? color : ""), nick,
+             weechat_color("reset"));
+    free(color);
+    print_lines(q->buffer, tags, prefix, text);
+}
+
+static void
+query_send(struct rrc_server *s, struct rrc_query *q, const char *text)
+{
+    const char *line = text, *nl, *err;
+    char piece[RRC_MAX_TEXT];
+    size_t len, max, take;
+
+    if (!s->welcomed) {
+        weechat_printf(q->buffer, "%snot connected", weechat_prefix("error"));
+        return;
+    }
+    max = rrc_max_direct(&s->session);
+    if (max > sizeof(piece) - 1)
+        max = sizeof(piece) - 1;
+    for (; line && *line; line = nl ? nl + 1 : NULL) {
+        nl = strchr(line, '\n');
+        len = nl ? (size_t)(nl - line) : strlen(line);
+        while (len > 0) {
+            take = len < max ? len : max;
+            while (take < len && take > 0 && ((uint8_t)line[take] & 0xc0) == 0x80)
+                take--;
+            if (take == 0)
+                break;
+            memcpy(piece, line, take);
+            piece[take] = '\0';
+            if (rrc_direct(&s->session, q->hash, piece, now_s(), &err) != 0) {
+                weechat_printf(q->buffer, "%scannot send: %s", weechat_prefix("error"), err);
+                return;
+            }
+            query_print(s, q, s->session.nick[0] ? s->session.nick : "me", piece, 1);
+            line += take;
+            len -= take;
+        }
+    }
+}
+
+static int
+query_input_cb(const void *pointer, void *data, struct t_gui_buffer *buffer, const char *input)
+{
+    struct rrc_server *s;
+    struct rrc_query *q = query_of_buffer(buffer, &s);
+
+    if (input[0] == '/' && input[1] == '/')
+        input++;
+    if (q)
+        query_send(s, q, input);
+    return WEECHAT_RC_OK;
+}
+
+static int
+query_close_cb(const void *pointer, void *data, struct t_gui_buffer *buffer)
+{
+    struct rrc_server *s;
+    struct rrc_query *q = query_of_buffer(buffer, &s);
+
+    if (q) {
+        q->buffer = NULL;
+        query_free(s, q);
+    }
+    return WEECHAT_RC_OK;
+}
+
+/* "nick" or a 32-character hash -> the identity, from the rooms on this
+ * server, then the nick cache. Returns 0, or -1 with a reason in err. */
+static int
+resolve_person(struct rrc_server *s, const char *who, uint8_t out[RNS_HASH_LEN],
+               char *err, size_t err_size)
+{
+    struct rrc_room *r;
+    struct rrc_member *m;
+    size_t i, found = 0;
+    uint8_t first[RNS_HASH_LEN];
+
+    if (strlen(who) == 2 * RNS_HASH_LEN && rns_unhex(who, out, RNS_HASH_LEN) == 0)
+        return 0;
+    for (r = s->rooms; r; r = r->next)
+        for (m = r->members; m; m = m->next)
+            if (m->hash_len == RNS_HASH_LEN && weechat_strcasecmp(m->nick, who) == 0) {
+                if (found && memcmp(first, m->hash, RNS_HASH_LEN) != 0) {
+                    snprintf(err, err_size, "more than one identity uses the nick %s: "
+                             "give the hash instead (see /who)", who);
+                    return -1;
+                }
+                memcpy(first, m->hash, RNS_HASH_LEN);
+                found = 1;
+            }
+    for (i = 0; !found && nick_cache && i < nick_cache_len; i++)
+        if (weechat_strcasecmp(nick_cache[i].nick, who) == 0) {
+            memcpy(first, nick_cache[i].hash, RNS_HASH_LEN);
+            found = 1;
+        }
+    if (!found) {
+        snprintf(err, err_size, "don't know who %s is: they need to have spoken in a room "
+                 "here, or give their 32-character identity hash", who);
+        return -1;
+    }
+    memcpy(out, first, RNS_HASH_LEN);
+    return 0;
+}
+
+/* /msg nick text, /query nick [text] */
+static void
+do_msg(struct rrc_server *s, struct t_gui_buffer *buffer, const char *args, int open)
+{
+    char who[RRC_MAX_NICK + 2 * RNS_HASH_LEN], err[200];
+    const char *sp = strchr(args, ' '), *text;
+    uint8_t hash[RNS_HASH_LEN];
+    struct rrc_query *q;
+    size_t n = sp ? (size_t)(sp - args) : strlen(args);
+
+    if (n == 0 || n >= sizeof(who)) {
+        weechat_printf(buffer, "%susage: /%s <nick|hash>%s", weechat_prefix("error"),
+                       open ? "query" : "msg", open ? " [text]" : " <text>");
+        return;
+    }
+    memcpy(who, args, n);
+    who[n] = '\0';
+    text = sp ? sp + 1 : "";
+    while (*text == ' ')
+        text++;
+    if (!open && !*text) {
+        weechat_printf(buffer, "%susage: /msg <nick|hash> <text>", weechat_prefix("error"));
+        return;
+    }
+    if (resolve_person(s, who, hash, err, sizeof(err)) != 0) {
+        weechat_printf(buffer, "%s%s", weechat_prefix("error"), err);
+        return;
+    }
+    if (s->welcomed && !s->session.hub_direct) {
+        weechat_printf(buffer, "%sthis hub doesn't forward direct messages",
+                       weechat_prefix("error"));
+        return;
+    }
+    q = query_open(s, hash, strlen(who) == 2 * RNS_HASH_LEN ? NULL : who, open);
+    if (q && *text)
+        query_send(s, q, text);
 }
 
 /* ---- sending ---- */
@@ -1684,7 +2133,8 @@ do_join(struct rrc_server *s, struct t_gui_buffer *buffer, const char *room)
                        weechat_prefix("network"), norm);
         return;
     }
-    if (rrc_join(&s->session, norm, now_s(), &err) != 0)
+    r->join_tries = 0;
+    if (room_join(s, r, &err) != 0)
         weechat_printf(r->buffer, "%scannot join: %s", weechat_prefix("error"), err);
 }
 
@@ -1980,6 +2430,8 @@ command_run_cb(const void *pointer, void *data, struct t_gui_buffer *buffer, con
     } else if (strcmp(verb, "nick") == 0) {
         if (*args)
             do_nick(s, buffer, args);
+    } else if (strcmp(verb, "msg") == 0 || strcmp(verb, "query") == 0) {
+        do_msg(s, buffer, args, strcmp(verb, "query") == 0);
     } else {
         hub_command(s, r, buffer, verb, args);
     }
@@ -1999,6 +2451,31 @@ completion_servers_cb(const void *pointer, void *data, const char *item,
 
 /* ---- timer ---- */
 
+#define JOIN_TRIES 3
+
+static void
+retry_joins(struct rrc_server *s, double now)
+{
+    struct rrc_room *r;
+    const char *err;
+    double wait = s->link->rtt * 10.0;
+
+    if (wait < 20.0)
+        wait = 20.0;
+    for (r = s->rooms; r; r = r->next) {
+        if (r->joined || !r->join_tries || now < r->join_sent + wait * r->join_tries)
+            continue;
+        if (r->join_tries >= JOIN_TRIES) {
+            r->join_tries = 0;
+            if (r->buffer)
+                weechat_printf(r->buffer, "%sno answer from the hub to joining %s; "
+                               "/join %s to try again", weechat_prefix("error"), r->name, r->name);
+            continue;
+        }
+        room_join(s, r, &err);
+    }
+}
+
 static int
 timer_cb(const void *pointer, void *data, int remaining_calls)
 {
@@ -2011,6 +2488,8 @@ timer_cb(const void *pointer, void *data, int remaining_calls)
             rns_client_tick(s->link, now);
             if (s->session_live && s->link && s->link->state == RNS_ACTIVE)
                 rrc_session_tick(&s->session, now);
+            if (s->welcomed && s->link)
+                retry_joins(s, now);
             server_after_io(s);
         } else if (s->conn == CONN_IDLE && s->reconnect_at > 0 && now >= s->reconnect_at) {
             s->reconnect_at = 0;
@@ -2018,12 +2497,16 @@ timer_cb(const void *pointer, void *data, int remaining_calls)
             server_connect(s);
         }
     }
+    if (nick_cache_dirty && now - nick_cache_saved >= 60.0) {
+        nick_cache_save();
+        nick_cache_saved = now;
+    }
     return WEECHAT_RC_OK;
 }
 
 /* ---- plugin ---- */
 
-static const char *RUN_VERBS[] = { "join", "part", "me", "nick", NULL };
+static const char *RUN_VERBS[] = { "join", "part", "me", "nick", "msg", "query", NULL };
 
 int
 weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
@@ -2036,6 +2519,7 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
     if (config_init() != 0)
         return WEECHAT_RC_ERROR;
     weechat_config_read(config_file);
+    nick_cache_load();
     servers_from_config();
 
     weechat_hook_command(
@@ -2068,7 +2552,8 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
             "raw[status]: link and hub details",
             "raw[identity]: show your identity hash",
             "",
-            "In RRC buffers, /join, /part, /me and /nick work as usual, and so do the hub's",
+            "In RRC buffers, /join, /part, /me, /nick, /msg and /query work as usual",
+            "(/msg and /query: direct messages, on hubs that forward them), and so do the hub's",
             "commands: /who, /names, /list, /topic, /register, /unregister, /mode, /op, /deop,",
             "/voice, /devoice, /kick, /ban, /invite, /kline, /stats. In a room buffer the room",
             "is filled in (/kick nick, /mode +t). //cmd sends any other /cmd to the hub.",
@@ -2104,6 +2589,10 @@ weechat_plugin_end(struct t_weechat_plugin *plugin)
 {
     while (servers)
         server_free(servers);
+    nick_cache_save();
+    free(nick_cache);
+    nick_cache = NULL;
+    nick_cache_len = nick_cache_next = 0;
     if (timer_hook)
         weechat_unhook(timer_hook);
     if (config_file) {
