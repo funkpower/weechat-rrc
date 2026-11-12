@@ -2,7 +2,8 @@
  * rns.c - a minimal Reticulum client
  *
  * Wire formats follow the Python reference implementation (RNS 1.x):
- * Packet.py, Identity.py, Link.py and Transport.py.
+ * Packet.py, Identity.py, Link.py and Transport.py; resources are in
+ * resource.c.
  *
  * Copyright (C) 2026 funkpower
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -17,6 +18,7 @@
 #include <unistd.h>
 
 #include "crypto.h"
+#include "resource.h"
 #include "rns.h"
 
 #define HEADER_1 0
@@ -325,8 +327,8 @@ exempt_from_dedup(const struct rns_packet *p)
     switch (p->context) {
     case RNS_CTX_KEEPALIVE:
     case RNS_CTX_RESOURCE:
-    case 0x03:  /* RESOURCE_REQ */
-    case 0x05:  /* RESOURCE_PRF */
+    case RNS_CTX_RESOURCE_REQ:
+    case RNS_CTX_RESOURCE_PRF:
     case 0x08:  /* CACHE_REQUEST */
     case 0x0e:  /* CHANNEL */
         return 1;
@@ -347,6 +349,7 @@ set_state(struct rns_client *c, enum rns_state state, const char *reason)
 static void
 wipe_link(struct rns_client *c)
 {
+    rns_resource_free(c);
     cr_wipe(c->eph_x_prv, sizeof(c->eph_x_prv));
     cr_wipe(c->eph_ed_seed, sizeof(c->eph_ed_seed));
     cr_wipe(c->key, sizeof(c->key));
@@ -365,6 +368,7 @@ rns_client_init(struct rns_client *c, const struct rns_identity *id,
     c->shared_instance = shared_instance;
     c->path_timeout = PATH_TIMEOUT_DEFAULT;
     c->mdu = RNS_LINK_MDU;
+    c->mtu = RNS_MTU;
     c->state = RNS_IDLE;
 }
 
@@ -546,9 +550,9 @@ update_keepalive(struct rns_client *c)
     c->stale_time = k * STALE_FACTOR;
 }
 
-static int
-send_link_packet(struct rns_client *c, uint8_t context, const uint8_t *plain, size_t len,
-                 int encrypt, double now)
+int
+rns_link_packet(struct rns_client *c, int packet_type, uint8_t context,
+                const uint8_t *plain, size_t len, int encrypt, double now)
 {
     uint8_t token[RNS_MTU], pkt[RNS_MTU];
     long tlen;
@@ -566,9 +570,18 @@ send_link_packet(struct rns_client *c, uint8_t context, const uint8_t *plain, si
         memcpy(token, plain, len);
         tlen = (long)len;
     }
-    n = build_packet(pkt, make_flags(HEADER_1, 0, TRANSPORT_BROADCAST, RNS_DT_LINK, RNS_PT_DATA),
+    if ((size_t)tlen > RNS_MTU - RNS_HEADER_MINSIZE)
+        return -1;
+    n = build_packet(pkt, make_flags(HEADER_1, 0, TRANSPORT_BROADCAST, RNS_DT_LINK, packet_type),
                      0, NULL, c->link_id, context, token, (size_t)tlen);
     return transmit(c, pkt, n, now);
+}
+
+static int
+send_link_packet(struct rns_client *c, uint8_t context, const uint8_t *plain, size_t len,
+                 int encrypt, double now)
+{
+    return rns_link_packet(c, RNS_PT_DATA, context, plain, len, encrypt, now);
 }
 
 static void
@@ -622,6 +635,7 @@ handle_link_proof(struct rns_client *c, const struct rns_packet *p, double now)
     if (c->rtt <= 0)
         c->rtt = 0.001;
     c->mdu = link_mdu_for(mtu);
+    c->mtu = mtu;
     c->activated_at = now;
     c->last_inbound = now;
     update_keepalive(c);
@@ -664,8 +678,24 @@ handle_link_data(struct rns_client *c, const struct rns_packet *p, double now)
             set_state(c, RNS_CLOSED, "the hub closed the link");
         }
         return;
+    case RNS_CTX_RESOURCE:
+        /* parts are not encrypted one by one: the whole resource is */
+        rns_resource_part(c, p->data, p->data_len, now);
+        return;
     case RNS_CTX_RESOURCE_ADV:
-        clog_(c, RNS_LOG_DEBUG, "resource transfer offered by the hub, not supported");
+    case RNS_CTX_RESOURCE_HMU:
+    case RNS_CTX_RESOURCE_ICL:
+        n = cr_token_decrypt(c->key, p->data, p->data_len, plain);
+        if (n < 0) {
+            clog_(c, RNS_LOG_DEBUG, "undecryptable resource packet dropped");
+            return;
+        }
+        if (p->context == RNS_CTX_RESOURCE_ADV)
+            rns_resource_advertised(c, plain, (size_t)n, now);
+        else if (p->context == RNS_CTX_RESOURCE_HMU)
+            rns_resource_hmu(c, plain, (size_t)n, now);
+        else
+            rns_resource_cancelled(c, plain, (size_t)n);
         return;
     default:
         clog_(c, RNS_LOG_DEBUG, "link packet with context 0x%02x ignored", p->context);
@@ -773,6 +803,7 @@ rns_client_tick(struct rns_client *c, double now)
             send_link_packet(c, RNS_CTX_KEEPALIVE, &ka, 1, 0, now);
             c->last_keepalive = now;
         }
+        rns_resource_tick(c, now);
         break;
     default:
         break;

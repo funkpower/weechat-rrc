@@ -8,9 +8,9 @@ network.
 
 Reticulum support is built in. The plugin implements the parts an RRC client needs
 (identities, announce validation, path requests, links with their handshake, encryption,
-identify and keepalive), so it needs no Python and no `rns` package of its own. It connects to
-a Reticulum node over TCP, or to the local `rnsd`, and that node routes it to the hub over
-whatever the network runs on: TCP, I2P, LoRa.
+identify and keepalive, and receiving resources), so it needs no Python and no `rns` package of
+its own. It connects to a Reticulum node over TCP, or to the local `rnsd`, and that node routes
+it to the hub over whatever the network runs on: TCP, I2P, LoRa.
 
 The examples use [Permanet](https://codeberg.org/permanet), a community Reticulum network
 whose chat hub, Permanet Chat, is `rrc://082f8e4293d19281108a5d4faa52dcbe/lobby`.
@@ -27,19 +27,19 @@ These steps are for Linux.
 Debian and Ubuntu:
 
 ```sh
-sudo apt install weechat weechat-dev build-essential pkg-config libssl-dev git
+sudo apt install weechat weechat-dev build-essential pkg-config libssl-dev libbz2-dev git
 ```
 
 Arch:
 
 ```sh
-sudo pacman -S weechat base-devel openssl git
+sudo pacman -S weechat base-devel openssl bzip2 git
 ```
 
 Fedora:
 
 ```sh
-sudo dnf install weechat weechat-devel gcc make pkgconf-pkg-config openssl-devel git
+sudo dnf install weechat weechat-devel gcc make pkgconf-pkg-config openssl-devel bzip2-devel git
 ```
 
 WeeChat 4.1 or later is needed; `weechat --version` tells you which you have.
@@ -304,8 +304,10 @@ the room to list the hub's rooms.
 
 ## Limits
 
-- Reticulum resource transfers are not supported, so what a hub sends as a resource (a long
-  MOTD, a `/who` reply for a busy room) does not arrive.
+- Resources (what a hub sends when it doesn't fit one packet, such as a long greeting) are
+  received up to 256 KiB, in one segment. Larger ones are turned down. `rrcd` 0.3.2 sends a
+  `/who` or `/list` reply too big for one packet neither way, so in a busy room the member list
+  stays partial.
 - Your own lines show when they are queued, not when the hub has accepted them.
 - Interfaces with IFAC (network name or passphrase) are not supported. Connect through a node that
   handles them.

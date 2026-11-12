@@ -103,6 +103,20 @@ struct rrc_queued {
 
 #define RRC_SENT_IDS 128
 #define RRC_PINGS 8
+#define RRC_RES_EXPECT 8
+
+/* A RESOURCE_ENVELOPE: a resource the hub is about to send (rrc_resource.c) */
+struct rrc_res_expect {
+    int used;
+    int kind;                   /* 1 notice, 2 motd, 0 anything else */
+    size_t size;
+    int has_sha256;
+    uint8_t sha256[32];
+    int has_src;
+    uint8_t src[RNS_HASH_LEN];
+    char room[RRC_MAX_ROOM];
+    double expires;
+};
 
 struct rrc_session {
     struct rrc_callbacks cb;
@@ -132,6 +146,8 @@ struct rrc_session {
     double refill_at;
     struct rrc_queued *queue_head, *queue_tail;
     size_t queued;
+
+    struct rrc_res_expect res_expect[RRC_RES_EXPECT];
 };
 
 void rrc_session_init(struct rrc_session *s, const uint8_t self[RNS_HASH_LEN],
@@ -142,6 +158,13 @@ void rrc_session_free(struct rrc_session *s);
 void rrc_session_start(struct rrc_session *s, double rtt, double now);
 void rrc_session_data(struct rrc_session *s, const uint8_t *data, size_t len, double now);
 void rrc_session_tick(struct rrc_session *s, double now);
+/* A resource the link received: delivered as the NOTICE its envelope
+ * announced, or dropped if none did. */
+void rrc_session_resource(struct rrc_session *s, const uint8_t *data, size_t len, double now);
+/* internal: a RESOURCE_ENVELOPE's body (rrc_resource.c) */
+struct cb_item;
+void rrc_res_envelope(struct rrc_session *s, const struct rrc_event *ev,
+                      const struct cb_item *body, double now);
 
 /* These queue an envelope; returns 0, or -1 with a reason in *err. */
 int rrc_join(struct rrc_session *s, const char *room, double now, const char **err);
