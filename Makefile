@@ -12,7 +12,7 @@ CFLAGS ?= -O2 -g
 override CFLAGS += -std=c99 -D_POSIX_C_SOURCE=200809L -D_DEFAULT_SOURCE -fPIC \
 	-Wall -Wextra -Wno-unused-parameter -DRRC_CLIENT_VERSION=\"$(VERSION)\"
 
-CORE := src/crypto.c src/cbor.c src/hdlc.c src/rns.c src/rrc.c
+CORE := src/crypto.c src/cbor.c src/hdlc.c src/rns.c src/rrc.c src/micron.c
 CORE_OBJ := $(CORE:.c=.o)
 
 PLUGIN_DIR ?= $(HOME)/.local/share/weechat/plugins

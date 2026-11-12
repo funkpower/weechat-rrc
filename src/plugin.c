@@ -20,6 +20,7 @@
 #include <weechat-plugin.h>
 
 #include "hdlc.h"
+#include "micron.h"
 #include "rns.h"
 #include "rrc.h"
 
@@ -102,6 +103,7 @@ static struct t_config_section *section_server = NULL;
 static struct t_config_option *opt_identity_file = NULL;
 static struct t_config_option *opt_path_timeout = NULL;
 static struct t_config_option *opt_debug = NULL;
+static struct t_config_option *opt_render_micron = NULL;
 
 static const char *SERVER_KEYS[] = { "hub", "address", "nick", "autojoin", "autoconnect", NULL };
 
@@ -207,6 +209,17 @@ config_init(void)
         "show Reticulum details (paths, links) in the server buffer",
         NULL, 0, 0, "off", NULL, 0,
         NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    {
+        struct t_config_section *look = weechat_config_new_section(
+            config_file, "look", 0, 0, NULL, NULL, NULL, NULL, NULL, NULL,
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+        opt_render_micron = weechat_config_new_option(
+            config_file, look, "render_micron", "boolean",
+            "show Micron formatting in messages (colours, bold...) as NomadNet does; "
+            "off shows the raw tags",
+            NULL, 0, 0, "on", NULL, 0,
+            NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL);
+    }
     section_server = weechat_config_new_section(config_file, "server", 1, 1,
                                                 NULL, NULL, NULL, NULL, NULL, NULL,
                                                 NULL, NULL, NULL,
@@ -334,18 +347,33 @@ server_buffer(struct rrc_server *s)
     return s->buffer ? s->buffer : NULL;
 }
 
+static const char *
+wcolor(const char *name)
+{
+    return weechat_color(name);
+}
+
+/* Print text line by line, with Micron formatting rendered when enabled. */
 static void
 print_lines(struct t_gui_buffer *buffer, const char *tags, const char *prefix,
             const char *text)
 {
+    static char line[RRC_MAX_TEXT], shown[8 * RRC_MAX_TEXT];
     const char *p = text, *nl;
+    size_t n;
 
     do {
         nl = strchr(p, '\n');
-        if (nl)
-            weechat_printf_date_tags(buffer, 0, tags, "%s%.*s", prefix, (int)(nl - p), p);
+        n = nl ? (size_t)(nl - p) : strlen(p);
+        if (n >= sizeof(line))
+            n = sizeof(line) - 1;
+        memcpy(line, p, n);
+        line[n] = '\0';
+        if (opt_render_micron && weechat_config_boolean(opt_render_micron) && micron_present(line))
+            micron_render(line, shown, sizeof(shown), &wcolor);
         else
-            weechat_printf_date_tags(buffer, 0, tags, "%s%s", prefix, p);
+            snprintf(shown, sizeof(shown), "%s", line);
+        weechat_printf_date_tags(buffer, 0, tags, "%s%s", prefix, shown);
         p = nl ? nl + 1 : NULL;
     } while (p && *p);
 }
@@ -1349,14 +1377,35 @@ servers_from_config(void)
 
 /* ---- sending ---- */
 
+/* Show a line we sent, as the hub will not echo it back to us. */
+static void
+echo_own(struct rrc_server *s, struct rrc_room *r, int type, const char *text)
+{
+    char tags[256], prefix[256], tagnick[RRC_MAX_NICK];
+    const char *nick = s->session.nick[0] ? s->session.nick : NULL;
+
+    tag_safe(nick ? nick : "self", tagnick, sizeof(tagnick));
+    if (type == RRC_T_ACTION) {
+        snprintf(tags, sizeof(tags), "rrc_action,notify_none,self_msg,no_highlight,nick_%s,log1",
+                 tagnick);
+        snprintf(prefix, sizeof(prefix), "%s%s%s%s ", weechat_prefix("action"),
+                 weechat_color("chat_nick_self"), nick ? nick : "me", weechat_color("reset"));
+    } else {
+        snprintf(tags, sizeof(tags), "rrc_msg,notify_none,self_msg,no_highlight,nick_%s,log1",
+                 tagnick);
+        snprintf(prefix, sizeof(prefix), "%s%s%s\t", weechat_color("chat_nick_self"),
+                 nick ? nick : "me", weechat_color("reset"));
+    }
+    print_lines(r->buffer, tags, prefix, text);
+}
+
 /* Send text to a room, split into lines and into pieces that fit. */
 static void
 room_send(struct rrc_server *s, struct rrc_room *r, int type, const char *text)
 {
     const char *line = text, *nl, *err;
-    char piece[RRC_MAX_TEXT], tags[256], prefix[256], tagnick[RRC_MAX_NICK];
+    char piece[RRC_MAX_TEXT];
     size_t len, max, take;
-    struct rrc_event ev;
 
     if (!s->welcomed || !r->joined) {
         weechat_printf(r->buffer, "%snot in %s (not connected)", weechat_prefix("error"), r->name);
@@ -1386,29 +1435,103 @@ room_send(struct rrc_server *s, struct rrc_room *r, int type, const char *text)
                 weechat_printf(r->buffer, "%scannot send: %s", weechat_prefix("error"), err);
                 return;
             }
-            memset(&ev, 0, sizeof(ev));
-            ev.type = type == RRC_T_ACTION ? RRC_EV_ACTION : RRC_EV_MSG;
-            ev.nick = s->session.nick[0] ? s->session.nick : NULL;
-            ev.src = s->session.self;
-            ev.text = piece;
-            tag_safe(ev.nick ? ev.nick : "self", tagnick, sizeof(tagnick));
-            if (type == RRC_T_ACTION) {
-                snprintf(tags, sizeof(tags), "rrc_action,notify_none,self_msg,no_highlight,nick_%s,log1",
-                         tagnick);
-                snprintf(prefix, sizeof(prefix), "%s%s%s%s ", weechat_prefix("action"),
-                         weechat_color("chat_nick_self"), ev.nick ? ev.nick : "me",
-                         weechat_color("reset"));
-            } else {
-                snprintf(tags, sizeof(tags), "rrc_msg,notify_none,self_msg,no_highlight,nick_%s,log1",
-                         tagnick);
-                snprintf(prefix, sizeof(prefix), "%s%s%s\t", weechat_color("chat_nick_self"),
-                         ev.nick ? ev.nick : "me", weechat_color("reset"));
-            }
-            weechat_printf_date_tags(r->buffer, 0, tags, "%s%s", prefix, piece);
+            echo_own(s, r, type, piece);
             line += take;
             len -= take;
         }
     }
+}
+
+/* ---- interface for scripts ---- */
+
+/* "rrc_input_send" signal, the RRC counterpart of irc_input_send:
+ *   "server;room;flags;text"
+ * flags (comma-separated, may be empty): "raw" sends text as one message,
+ * exactly as given (no splitting, no hub commands) and fails if it does not
+ * fit; without it, text is handled as if typed in the room buffer.
+ * Returns WEECHAT_RC_OK when queued, WEECHAT_RC_ERROR otherwise. */
+static int
+input_send_signal_cb(const void *pointer, void *data, const char *signal,
+                     const char *type_data, void *signal_data)
+{
+    const char *msg = signal_data, *p[3], *text, *err;
+    char server[64], room[RRC_MAX_ROOM], flags[64];
+    struct rrc_server *s;
+    struct rrc_room *r;
+    size_t n;
+    int i, raw;
+
+    if (!msg || strcmp(type_data, WEECHAT_HOOK_SIGNAL_STRING) != 0)
+        return WEECHAT_RC_ERROR;
+    text = msg;
+    for (i = 0; i < 3; i++) {
+        p[i] = strchr(text, ';');
+        if (!p[i])
+            return WEECHAT_RC_ERROR;
+        text = p[i] + 1;
+    }
+    n = (size_t)(p[0] - msg);
+    if (n == 0 || n >= sizeof(server))
+        return WEECHAT_RC_ERROR;
+    memcpy(server, msg, n);
+    server[n] = '\0';
+    n = (size_t)(p[1] - p[0] - 1);
+    if (n >= sizeof(room))
+        return WEECHAT_RC_ERROR;
+    memcpy(room, p[0] + 1, n);
+    room[n] = '\0';
+    n = (size_t)(p[2] - p[1] - 1);
+    if (n >= sizeof(flags))
+        return WEECHAT_RC_ERROR;
+    memcpy(flags, p[1] + 1, n);
+    flags[n] = '\0';
+    raw = strstr(flags, "raw") != NULL;
+
+    s = server_find(server);
+    r = s ? room_find(s, room) : NULL;
+    if (!s || !r || !r->buffer || !s->welcomed || !r->joined || !*text)
+        return WEECHAT_RC_ERROR;
+    if (!raw) {
+        room_send(s, r, RRC_T_MSG, text);
+        return WEECHAT_RC_OK;
+    }
+    if (strchr(text, '\n') || rrc_say(&s->session, RRC_T_MSG, r->name, text, now_s(), &err) != 0)
+        return WEECHAT_RC_ERROR;
+    echo_own(s, r, RRC_T_MSG, text);
+    return WEECHAT_RC_OK;
+}
+
+/* info "rrc_max_body", arguments "server,room": the largest message body in
+ * bytes that fits one packet to that room now ("0" when not joined).
+ * info "rrc_queue", arguments "server": messages waiting for the rate limit. */
+static char *
+info_cb(const void *pointer, void *data, const char *info_name, const char *arguments)
+{
+    char server[64], buf[32];
+    const char *comma;
+    struct rrc_server *s;
+    struct rrc_room *r;
+    size_t n;
+
+    if (!arguments)
+        return NULL;
+    comma = strchr(arguments, ',');
+    n = comma ? (size_t)(comma - arguments) : strlen(arguments);
+    if (n == 0 || n >= sizeof(server))
+        return NULL;
+    memcpy(server, arguments, n);
+    server[n] = '\0';
+    s = server_find(server);
+    if (!s)
+        return NULL;
+    if (strcmp(info_name, "rrc_queue") == 0) {
+        snprintf(buf, sizeof(buf), "%zu", s->session_live ? s->session.queued : 0);
+        return strdup(buf);
+    }
+    r = comma ? room_find(s, comma + 1) : NULL;
+    snprintf(buf, sizeof(buf), "%zu",
+             (r && r->joined && s->welcomed) ? rrc_max_body(&s->session, r->name) : 0);
+    return strdup(buf);
 }
 
 static int
@@ -1902,6 +2025,11 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
         weechat_hook_command_run(cmd, &command_run_cb, HUB_COMMANDS[i].verb, NULL);
     }
     timer_hook = weechat_hook_timer(250, 0, 0, &timer_cb, NULL, NULL);
+    weechat_hook_signal("rrc_input_send", &input_send_signal_cb, NULL, NULL);
+    weechat_hook_info("rrc_max_body", "largest message body (bytes) that fits a room now",
+                      "server,room", &info_cb, NULL, NULL);
+    weechat_hook_info("rrc_queue", "RRC messages waiting for the hub's rate limit",
+                      "server", &info_cb, NULL, NULL);
 
     for (s = servers; s; s = s->next)
         if (server_bool(s->name, "autoconnect"))

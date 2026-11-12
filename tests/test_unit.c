@@ -11,6 +11,7 @@
 #include "../src/cbor.h"
 #include "../src/crypto.h"
 #include "../src/hdlc.h"
+#include "../src/micron.h"
 #include "../src/rns.h"
 #include "../src/rrc.h"
 #include "vectors.h"
@@ -210,9 +211,48 @@ test_keepalive_not_deduplicated(void)
     CHECK(c.last_inbound == 200.0, "an identical later keepalive counts too");
 }
 
+static const char *
+fake_color(const char *name)
+{
+    static char ring[8][40];
+    static int i;
+    i = (i + 1) % 8;
+    snprintf(ring[i], sizeof(ring[i]), "<%s>", name);
+    return ring[i];
+}
+
+static void
+test_micron(void)
+{
+    char out[512];
+
+    CHECK(micron_xterm256(255, 0, 0) == 196, "xterm red");
+    CHECK(micron_xterm256(0, 0, 0) == 16, "xterm black");
+    CHECK(micron_xterm256(128, 128, 128) == 244, "xterm grey");
+
+    CHECK(micron_render("\xc2\xa6" "Bf00  " "\xc2\xa6" "b x", out, sizeof(out), fake_color) == 1
+          && strcmp(out, "<default,196>  <default,default> x<reset>") == 0, "broken-bar colour");
+    CHECK(micron_render("`F0f0hi`f", out, sizeof(out), fake_color) == 1
+          && strcmp(out, "<46,default>hi<default,default><reset>") == 0, "backtick colour");
+    CHECK(micron_render("use `foo` and `bar`", out, sizeof(out), fake_color) == 0
+          && strcmp(out, "use `foo` and `bar`") == 0, "prose backticks untouched");
+    CHECK(micron_render("\xc2\xa6" "!bold" "\xc2\xa6" "! \xc2\xa6" "Q", out, sizeof(out), fake_color) == 1
+          && strcmp(out, "<bold>bold<-bold> \xc2\xa6Q<reset>") == 0, "bold toggle, unknown tag kept");
+    CHECK(micron_render("\xc2\xa6" "BT102030x", out, sizeof(out), fake_color) == 1
+          && strstr(out, "x<reset>") != NULL, "24-bit colour");
+    CHECK(micron_render("\xc2\xa6" "Bzzz", out, sizeof(out), fake_color) == 0, "bad hex is text");
+    CHECK(micron_present("a \xc2\xa6" "F123 b") && !micron_present("a `b` c"), "presence");
+    {
+        char small[12];
+        micron_render("\xc2\xa6" "Bf00\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88", small, sizeof(small), fake_color);
+        CHECK(strlen(small) < sizeof(small), "truncated output stays terminated");
+    }
+}
+
 int
 main(void)
 {
+    test_micron();
     test_keepalive_not_deduplicated();
     test_identity();
     test_kdf_and_token();
