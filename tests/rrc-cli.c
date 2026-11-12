@@ -6,7 +6,9 @@
  * With "-" as the room it lists the hub's rooms (//list) instead.
  *
  * Connects, links, identifies, joins the room, sends each message, prints
- * every event, and exits a few seconds after the last message.
+ * every event, and exits a few seconds after the last message. A message
+ * "!rehello" sends HELLO again instead. RRC_CLI_LINGER in the environment
+ * sets how long it stays after the last message (default 4 seconds).
  *
  * Copyright (C) 2026 funkpower
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -67,6 +69,13 @@ static void
 on_data(void *ctx, const uint8_t *data, size_t len)
 {
     rrc_session_data(&session, data, len, now_s());
+}
+
+static void
+on_resource(void *ctx, const uint8_t *data, size_t len)
+{
+    printf("[resource] %zu bytes\n", len);
+    rrc_session_resource(&session, data, len, now_s());
 }
 
 static void
@@ -181,7 +190,7 @@ main(int argc, char **argv)
 {
     struct rns_identity id;
     uint8_t hub[RNS_HASH_LEN];
-    struct rns_callbacks rcb = { net_send, on_state, on_data, on_log };
+    struct rns_callbacks rcb = { net_send, on_state, on_data, on_log, on_resource };
     struct rrc_callbacks scb = { link_send, link_mdu, on_event };
     int shared, sent = 0, i, pinged = 0;
     const char *err;
@@ -244,13 +253,20 @@ main(int argc, char **argv)
             sent = -1;
         }
         if (joined && sent <= 0) {
-            for (i = 5; i < argc; i++)
+            for (i = 5; i < argc; i++) {
+                if (strcmp(argv[i], "!rehello") == 0) {
+                    /* HELLO again: rrcd welcomes us, and sends its greeting, again */
+                    rrc_session_start(&session, client.rtt, t);
+                    continue;
+                }
                 if (rrc_say(&session, RRC_T_MSG, argv[4], argv[i], t, &err) != 0)
                     printf("[say failed] %s\n", err);
+            }
             if (!pinged && rrc_ping(&session, t, &err) == 0)
                 pinged = 1;
             sent = 1;
-            finish_at = t + 4.0;
+            /* RRC_CLI_LINGER: seconds to stay after the last message */
+            finish_at = t + (getenv("RRC_CLI_LINGER") ? atof(getenv("RRC_CLI_LINGER")) : 4.0);
         }
         if (sent == 1 && t >= finish_at) {
             rns_client_close(&client, t, "done");

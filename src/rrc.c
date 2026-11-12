@@ -36,6 +36,7 @@
 #define L_MAX_ROOMS 3
 #define L_RATE 4
 /* capabilities */
+#define CAP_RESOURCE_ENVELOPE 0
 #define CAP_ACTION 1
 
 #define HELLO_MAX_TRIES 5
@@ -267,7 +268,9 @@ put_envelope(struct rrc_session *s, struct cb_writer *w, int type, const char *r
         cb_put_uint(w, B_HELLO_VER);
         cb_put_text(w, RRC_CLIENT_VERSION, strlen(RRC_CLIENT_VERSION));
         cb_put_uint(w, B_HELLO_CAPS);
-        cb_put_map(w, 1);
+        cb_put_map(w, 2);
+        cb_put_uint(w, CAP_RESOURCE_ENVELOPE);
+        cb_put_bool(w, 1);
         cb_put_uint(w, CAP_ACTION);
         cb_put_bool(w, 1);
         break;
@@ -475,6 +478,7 @@ rrc_session_start(struct rrc_session *s, double rtt, double now)
     s->hello_tries = 0;
     memset(s->pending_join, 0, sizeof(s->pending_join));
     memset(s->pending_part, 0, sizeof(s->pending_part));
+    memset(s->res_expect, 0, sizeof(s->res_expect));
     s->hello_interval = rtt * 6.0;
     if (s->hello_interval < 5.0)
         s->hello_interval = 5.0;
@@ -772,6 +776,10 @@ rrc_session_data(struct rrc_session *s, const uint8_t *data, size_t len, double 
                 return;
             }
         }
+        return;
+
+    case RRC_T_RESOURCE_ENVELOPE:
+        rrc_res_envelope(s, &ev, body, now);
         return;
 
     default:

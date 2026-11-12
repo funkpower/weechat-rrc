@@ -3,6 +3,7 @@
 
 Run with an interpreter that has rns and cbor2:  python3 tests/gen_vectors.py
 """
+import bz2
 import hashlib
 import hmac
 import os
@@ -14,6 +15,7 @@ from RNS.Cryptography import hkdf
 from RNS.Cryptography.Token import Token
 from RNS.Cryptography.AES import AES_256_CBC
 from RNS.Cryptography import PKCS7
+from RNS.vendor import umsgpack
 
 
 def c_bytes(name, data):
@@ -63,5 +65,78 @@ out.append(c_bytes("V_CBOR_ENV", cbor2.dumps(env)))
 welcome = {0: 1, 1: 2, 2: b"\x02" * 8, 3: 1737849600000, 4: peer.hash,
            6: {0: "testhub", 1: "0.3.2", 2: {0: True, 1: True}, 3: {0: 32, 1: 64, 2: 350, 3: 32, 4: 240}}}
 out.append(c_bytes("V_CBOR_WELCOME", cbor2.dumps(welcome)))
+
+
+# ---- resources ----
+
+class FakeLink:
+    """Just enough of RNS.Link for RNS.Resource to build a resource offline."""
+    def __init__(self, key, link_id):
+        self.type = RNS.Destination.LINK
+        self.link_id = link_id
+        self.hash = link_id
+        self.mtu = 500
+        self.mdu = 431
+        self.rtt = 0.05
+        self.traffic_timeout_factor = 6
+        self.status = RNS.Link.ACTIVE
+        self.token = Token(key)
+
+    def encrypt(self, plaintext):
+        return self.token.encrypt(plaintext)
+
+
+def greeting(lines):
+    # tests/test_unit.c builds the same text
+    return "".join("line %d of a long greeting\n" % i for i in range(lines)).encode()
+
+
+res_key = bytes(range(64, 128))
+res_link = FakeLink(res_key, bytes(range(0x40, 0x50)))
+out.append(c_bytes("V_RES_KEY", res_key))
+out.append(c_bytes("V_RES_LINK_ID", res_link.link_id))
+
+
+def resource(name, lines, compress, whole_stream=False):
+    data = greeting(lines)
+    r = RNS.Resource(data, res_link, advertise=False, auto_compress=compress)
+    stream = b"".join(p.data for p in r.parts)
+    plain = Token(res_key).decrypt(stream)
+    out.append("#define %s_LINES %d\n" % (name, lines))
+    out.append(c_bytes(name + "_ADV", RNS.ResourceAdvertisement(r).pack()))
+    if whole_stream:
+        out.append(c_bytes(name + "_STREAM", stream))
+    else:
+        # the stream is rebuilt from the data with this IV and random prefix
+        out.append(c_bytes(name + "_IV", stream[:16]))
+        out.append(c_bytes(name + "_PREFIX", plain[:4]))
+        out.append(c_bytes(name + "_STREAM_SHA", hashlib.sha256(stream).digest()))
+    out.append(c_bytes(name + "_PROOF", r.hash + r.expected_proof))
+    return r
+
+
+# rrcd's way: one segment, not compressed
+res1 = resource("V_RES1", 50, False)
+# compressed with bz2
+res2 = resource("V_RES2", 300, True, whole_stream=True)
+assert res2.compressed and len(res2.parts) <= 3
+# more parts than one advertisement maps: needs a hashmap update
+res3 = resource("V_RES3", 1600, False)
+seg_len = RNS.ResourceAdvertisement.HASHMAP_MAX_LEN
+assert len(res3.parts) > seg_len
+out.append(c_bytes("V_RES3_HMU", res3.hash + umsgpack.packb([1, res3.hashmap[seg_len * 4:]])))
+# too large for us (RNS_RESOURCE_MAX is 256 KiB)
+big = RNS.Resource(os.urandom(300000), res_link, advertise=False, auto_compress=False)
+out.append(c_bytes("V_RES_BIG_ADV", RNS.ResourceAdvertisement(big).pack()))
+out.append(c_bytes("V_RES_BIG_HASH", big.hash))
+# a bz2 bomb: 300000 zero bytes in a few dozen
+out.append(c_bytes("V_BZ2_BOMB", bz2.compress(bytes(300000))))
+
+# the RESOURCE_ENVELOPE rrcd sends before res1
+data1 = greeting(50)
+envelope = {0: 1, 1: 50, 2: b"\x03" * 8, 3: 1737849600000, 4: peer.hash,
+            6: {0: b"\x04" * 8, 1: "motd", 2: len(data1), 3: hashlib.sha256(data1).digest(),
+                4: "utf-8"}}
+out.append(c_bytes("V_CBOR_RES_ENV", cbor2.dumps(envelope)))
 
 sys.stdout.write("".join(out))

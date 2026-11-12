@@ -811,6 +811,15 @@ link_data_cb(void *ctx, const uint8_t *data, size_t len)
         rrc_session_data(&s->session, data, len, now_s());
 }
 
+static void
+link_resource_cb(void *ctx, const uint8_t *data, size_t len)
+{
+    struct rrc_server *s = ctx;
+
+    if (s->session_live)
+        rrc_session_resource(&s->session, data, len, now_s());
+}
+
 /* ---- RRC events ---- */
 
 static void
@@ -1169,7 +1178,8 @@ read_cb(const void *pointer, void *data, int fd)
 static void
 server_link_up(struct rrc_server *s, int fd)
 {
-    struct rns_callbacks rcb = { &net_send_cb, &link_state_cb, &link_data_cb, &link_log_cb };
+    struct rns_callbacks rcb = { &net_send_cb, &link_state_cb, &link_data_cb, &link_log_cb,
+                                 &link_resource_cb };
     struct rrc_callbacks scb = { &session_send_cb, &session_mdu_cb, &session_event_cb };
     uint8_t hub[RNS_HASH_LEN];
     const char *nick;

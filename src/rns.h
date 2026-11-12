@@ -4,8 +4,9 @@
  *
  * It implements just enough of Reticulum to be an RRC client: identities,
  * packets, announce validation, path requests, links (handshake, encryption,
- * identify, keepalive, teardown). It owns no sockets and no timers; the
- * caller feeds it packets and calls rns_client_tick() regularly.
+ * identify, keepalive, teardown) and resources the destination sends. It
+ * owns no sockets and no timers; the caller feeds it packets and calls
+ * rns_client_tick() regularly.
  *
  * Copyright (C) 2026 funkpower
  * SPDX-License-Identifier: GPL-3.0-or-later
@@ -43,6 +44,11 @@
 #define RNS_CTX_NONE 0x00
 #define RNS_CTX_RESOURCE 0x01
 #define RNS_CTX_RESOURCE_ADV 0x02
+#define RNS_CTX_RESOURCE_REQ 0x03
+#define RNS_CTX_RESOURCE_HMU 0x04
+#define RNS_CTX_RESOURCE_PRF 0x05
+#define RNS_CTX_RESOURCE_ICL 0x06
+#define RNS_CTX_RESOURCE_RCL 0x07
 #define RNS_CTX_PATH_RESPONSE 0x0b
 #define RNS_CTX_KEEPALIVE 0xfa
 #define RNS_CTX_LINKIDENTIFY 0xfb
@@ -110,9 +116,14 @@ struct rns_callbacks {
     /* Decrypted payload of a DATA packet on the link. */
     void (*data)(void *ctx, const uint8_t *data, size_t len);
     void (*log)(void *ctx, int level, const char *msg);
+    /* A resource the hub sent, received whole and checked against its hash
+     * (may be NULL: resources are then received and dropped). */
+    void (*resource)(void *ctx, const uint8_t *data, size_t len);
 };
 
 #define RNS_SEEN_MAX 256
+
+struct rns_resource;
 
 struct rns_client {
     struct rns_identity id;
@@ -150,6 +161,10 @@ struct rns_client {
     double last_outbound;
     double last_keepalive;
     size_t mdu;
+    int mtu;
+
+    /* the resource being received, if any (resource.c) */
+    struct rns_resource *resource;
 
     /* recently seen packet hashes, to drop duplicates */
     uint8_t seen[RNS_SEEN_MAX][RNS_HASH_LEN];
