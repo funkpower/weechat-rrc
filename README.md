@@ -76,7 +76,8 @@ open.
 | `/rrc status` | link, hops, round trip, hub limits |
 | `/rrc identity` | your identity hash |
 
-In RRC buffers `/join`, `/part`, `/me` and `/nick` work as they do on IRC. Text that starts
+In RRC buffers `/join`, `/part`, `/me`, `/nick` and `/topic` work as they do on IRC, and a room's
+topic is its buffer title. Text that starts
 with `//` goes to the hub as a hub command. On `rrcd` hubs, `//list` lists the registered rooms
 and `//who` shows who is in a room. `//topic` and `//register` work there too.
 

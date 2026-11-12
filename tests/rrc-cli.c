@@ -3,6 +3,8 @@
  *
  *   rrc-cli <host:port | unix:NAME> <hub-hash> <identity-file> <room> [message...]
  *
+ * With "-" as the room it lists the hub's rooms (//list) instead.
+ *
  * Connects, links, identifies, joins the room, sends each message, prints
  * every event, and exits a few seconds after the last message.
  *
@@ -228,7 +230,15 @@ main(int argc, char **argv)
         rns_client_tick(&client, t);
         if (client.state == RNS_ACTIVE)
             rrc_session_tick(&session, t);
-        if (welcomed && !joined && sent == 0) {
+        if (welcomed && strcmp(argv[4], "-") == 0) {
+            /* probe: list the hub's rooms and leave */
+            if (sent == 0) {
+                if (rrc_say(&session, RRC_T_MSG, NULL, "/list", t, &err) != 0)
+                    printf("[list failed] %s\n", err);
+                sent = 1;
+                finish_at = t + 15.0;
+            }
+        } else if (welcomed && !joined && sent == 0) {
             if (rrc_join(&session, argv[4], t, &err) != 0)
                 printf("[join failed] %s\n", err);
             sent = -1;

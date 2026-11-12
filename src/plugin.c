@@ -772,6 +772,77 @@ join_rooms(struct rrc_server *s)
     weechat_string_free_split(list);
 }
 
+static void
+room_set_topic(struct rrc_room *r, const char *topic, size_t len)
+{
+    char title[RRC_MAX_TEXT];
+
+    if (!r->buffer)
+        return;
+    if (len >= sizeof(title))
+        len = sizeof(title) - 1;
+    memcpy(title, topic, len);
+    title[len] = '\0';
+    if (strcmp(title, "(none)") == 0 || strcmp(title, "(cleared)") == 0)
+        title[0] = '\0';
+    weechat_buffer_set(r->buffer, "title", title);
+}
+
+/* Room name between prefix and ": " (or " is now: "), as rrcd writes it. */
+static struct rrc_room *
+notice_room(struct rrc_server *s, const char *text, const char *prefix, const char *sep,
+            const char **rest)
+{
+    char room[RRC_MAX_ROOM];
+    const char *end;
+    size_t n;
+
+    if (strncmp(text, prefix, strlen(prefix)) != 0)
+        return NULL;
+    end = strstr(text + strlen(prefix), sep);
+    if (!end)
+        return NULL;
+    n = (size_t)(end - text) - strlen(prefix);
+    if (n == 0 || n >= sizeof(room))
+        return NULL;
+    memcpy(room, text + strlen(prefix), n);
+    room[n] = '\0';
+    *rest = end + strlen(sep);
+    return room_find(s, room);
+}
+
+/* The topic, from the notices rrcd sends:
+ *   "room lobby: unregistered; mode=(none); topic=(none)"   (on join)
+ *   "room x: registered; topic=Some topic; modes=+r"         (other hubs)
+ *   "topic for lobby: Some topic"                            (/topic lobby)
+ *   "topic for lobby is now: Some topic"                     (a change) */
+static void
+handle_topic_notice(struct rrc_server *s, const char *text)
+{
+    struct rrc_room *r;
+    const char *rest, *topic, *end, *cut;
+
+    if (strchr(text, '\n'))
+        return;
+    if ((r = notice_room(s, text, "topic for ", " is now: ", &rest))
+        || (r = notice_room(s, text, "topic for ", ": ", &rest))) {
+        room_set_topic(r, rest, strlen(rest));
+        return;
+    }
+    if ((r = notice_room(s, text, "room ", ": ", &rest))) {
+        topic = strstr(rest, "topic=");
+        if (!topic)
+            return;
+        topic += 6;
+        end = topic + strlen(topic);
+        /* the field ends at a following "; mode" field, if any */
+        cut = strstr(topic, "; mode");
+        if (cut)
+            end = cut;
+        room_set_topic(r, topic, (size_t)(end - topic));
+    }
+}
+
 /* "members in lobby: nick (0123456789ab), nick2 (...), 0123...ef" */
 static int
 handle_who_notice(struct rrc_server *s, const char *text)
@@ -932,6 +1003,7 @@ session_event_cb(void *ctx, const struct rrc_event *ev)
     case RRC_EV_NOTICE:
         if (handle_who_notice(s, ev->text))
             break;
+        handle_topic_notice(s, ev->text);
         snprintf(prefix, sizeof(prefix), "%s", weechat_prefix("network"));
         print_lines(r && r->buffer ? r->buffer : s->buffer, "rrc_notice,notify_message,log3",
                     prefix, ev->text);
@@ -1654,7 +1726,52 @@ rrc_command_cb(const void *pointer, void *data, struct t_gui_buffer *buffer,
     return WEECHAT_RC_OK;
 }
 
-/* /join, /part, /me, /nick typed in an RRC buffer */
+/* rrcd's hub commands; needs_room: the room comes first in its arguments,
+ * and in a room buffer it is filled in, IRC style ("/kick nick") */
+static const struct { const char *verb; int needs_room; } HUB_COMMANDS[] = {
+    { "who", 0 }, { "names", 0 }, { "list", 0 }, { "stats", 0 }, { "kline", 0 },
+    { "topic", 1 }, { "register", 1 }, { "unregister", 1 }, { "mode", 1 },
+    { "op", 1 }, { "deop", 1 }, { "voice", 1 }, { "devoice", 1 },
+    { "kick", 1 }, { "ban", 1 }, { "invite", 1 },
+    { NULL, 0 },
+};
+
+static void
+hub_command(struct rrc_server *s, struct rrc_room *r, struct t_gui_buffer *buffer,
+            const char *verb, const char *args)
+{
+    char cmd[RRC_MAX_TEXT], first[RRC_MAX_ROOM];
+    const char *err, *sp;
+    size_t n;
+    int i, insert = 0;
+
+    if (!s->welcomed) {
+        weechat_printf(buffer, "%snot connected", weechat_prefix("error"));
+        return;
+    }
+    for (i = 0; HUB_COMMANDS[i].verb; i++)
+        if (strcmp(HUB_COMMANDS[i].verb, verb) == 0)
+            insert = HUB_COMMANDS[i].needs_room && r;
+    if (insert) {
+        /* unless the room was named already */
+        sp = strchr(args, ' ');
+        n = sp ? (size_t)(sp - args) : strlen(args);
+        if (n && n < sizeof(first)) {
+            memcpy(first, args, n);
+            first[n] = '\0';
+            if (strcmp(first, r->name) == 0 || (room_find(s, first) && strcmp(verb, "topic") != 0))
+                insert = 0;
+        }
+    }
+    if (insert)
+        snprintf(cmd, sizeof(cmd), "/%s %s%s%s", verb, r->name, *args ? " " : "", args);
+    else
+        snprintf(cmd, sizeof(cmd), "/%s%s%s", verb, *args ? " " : "", args);
+    if (rrc_say(&s->session, RRC_T_MSG, r ? r->name : NULL, cmd, now_s(), &err) != 0)
+        weechat_printf(buffer, "%scannot send: %s", weechat_prefix("error"), err);
+}
+
+/* /join, /part, /me, /nick and the hub commands typed in an RRC buffer */
 static int
 command_run_cb(const void *pointer, void *data, struct t_gui_buffer *buffer, const char *command)
 {
@@ -1678,6 +1795,8 @@ command_run_cb(const void *pointer, void *data, struct t_gui_buffer *buffer, con
     } else if (strcmp(verb, "nick") == 0) {
         if (*args)
             do_nick(s, buffer, args);
+    } else {
+        hub_command(s, r, buffer, verb, args);
     }
     return WEECHAT_RC_OK_EAT;
 }
@@ -1764,8 +1883,10 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
             "raw[status]: link and hub details",
             "raw[identity]: show your identity hash",
             "",
-            "In RRC buffers, /join, /part, /me and /nick work as usual, and //cmd sends",
-            "/cmd to the hub as a hub command (rrcd: //list, //who, //topic, //register...).",
+            "In RRC buffers, /join, /part, /me and /nick work as usual, and so do the hub's",
+            "commands: /who, /names, /list, /topic, /register, /unregister, /mode, /op, /deop,",
+            "/voice, /devoice, /kick, /ban, /invite, /kline, /stats. In a room buffer the room",
+            "is filled in (/kick nick, /mode +t). //cmd sends any other /cmd to the hub.",
             "",
             "Options: /set rrc.server.<name>.* (hub, address, nick, autojoin, autoconnect)",
             "and /set rrc.network.*"),
@@ -1775,6 +1896,10 @@ weechat_plugin_init(struct t_weechat_plugin *plugin, int argc, char *argv[])
     for (i = 0; RUN_VERBS[i]; i++) {
         snprintf(cmd, sizeof(cmd), "/%s", RUN_VERBS[i]);
         weechat_hook_command_run(cmd, &command_run_cb, RUN_VERBS[i], NULL);
+    }
+    for (i = 0; HUB_COMMANDS[i].verb; i++) {
+        snprintf(cmd, sizeof(cmd), "/%s", HUB_COMMANDS[i].verb);
+        weechat_hook_command_run(cmd, &command_run_cb, HUB_COMMANDS[i].verb, NULL);
     }
     timer_hook = weechat_hook_timer(250, 0, 0, &timer_cb, NULL, NULL);
 
