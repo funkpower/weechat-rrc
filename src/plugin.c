@@ -564,6 +564,39 @@ set_nick_localvar(struct rrc_server *s)
     }
 }
 
+/*
+ * Create a buffer with its name and localvars already set when the
+ * buffer_opened signal fires (logger.file.log_conditions and scripts read
+ * them there), then ask the logger to replay the end of its log file, as
+ * the irc plugin does: buffers are closed on plugin unload, so this is
+ * what brings the conversation back after a reload or restart. Only for
+ * new buffers: one that survives (reconnect) keeps its lines.
+ */
+static struct t_gui_buffer *
+buffer_create(const char *name, const char *short_name, const char *type,
+              const char *server, int (*input_cb)(const void *, void *,
+                                                  struct t_gui_buffer *, const char *),
+              int (*close_cb)(const void *, void *, struct t_gui_buffer *))
+{
+    struct t_hashtable *props;
+    struct t_gui_buffer *b;
+
+    props = weechat_hashtable_new(8, WEECHAT_HASHTABLE_STRING, WEECHAT_HASHTABLE_STRING,
+                                  NULL, NULL);
+    if (props) {
+        weechat_hashtable_set(props, "short_name", short_name);
+        weechat_hashtable_set(props, "localvar_set_type", type);
+        weechat_hashtable_set(props, "localvar_set_server", server);
+        weechat_hashtable_set(props, "localvar_set_channel", short_name);
+    }
+    b = weechat_buffer_new_props(name, props, input_cb, NULL, NULL, close_cb, NULL, NULL);
+    if (props)
+        weechat_hashtable_free(props);
+    if (b)
+        (void)weechat_hook_signal_send("logger_backlog", WEECHAT_HOOK_SIGNAL_POINTER, b);
+    return b;
+}
+
 static void
 server_buffer_open(struct rrc_server *s)
 {
@@ -579,15 +612,11 @@ server_buffer_open(struct rrc_server *s)
         weechat_buffer_set_pointer(s->buffer, "input_callback", &server_input_cb);
         weechat_buffer_set_pointer(s->buffer, "close_callback", &server_close_cb);
     } else {
-        s->buffer = weechat_buffer_new(name, &server_input_cb, NULL, NULL,
-                                       &server_close_cb, NULL, NULL);
+        s->buffer = buffer_create(name, s->name, "server", s->name,
+                                  &server_input_cb, &server_close_cb);
     }
     if (!s->buffer)
         return;
-    weechat_buffer_set(s->buffer, "short_name", s->name);
-    weechat_buffer_set(s->buffer, "localvar_set_type", "server");
-    weechat_buffer_set(s->buffer, "localvar_set_server", s->name);
-    weechat_buffer_set(s->buffer, "localvar_set_channel", s->name);
     weechat_buffer_set(s->buffer, "title", "Reticulum Relay Chat");
     set_nick_localvar(s);
 }
@@ -614,15 +643,11 @@ room_open(struct rrc_server *s, const char *room, int switch_to)
             weechat_buffer_set_pointer(r->buffer, "input_callback", &room_input_cb);
             weechat_buffer_set_pointer(r->buffer, "close_callback", &room_close_cb);
         } else {
-            r->buffer = weechat_buffer_new(name, &room_input_cb, NULL, NULL,
-                                           &room_close_cb, NULL, NULL);
+            r->buffer = buffer_create(name, room, "channel", s->name,
+                                      &room_input_cb, &room_close_cb);
         }
         if (!r->buffer)
             return r;
-        weechat_buffer_set(r->buffer, "short_name", room);
-        weechat_buffer_set(r->buffer, "localvar_set_type", "channel");
-        weechat_buffer_set(r->buffer, "localvar_set_server", s->name);
-        weechat_buffer_set(r->buffer, "localvar_set_channel", room);
         weechat_buffer_set(r->buffer, "nicklist", "1");
         weechat_buffer_set(r->buffer, "nicklist_display_groups", "0");
         set_nick_localvar(s);
