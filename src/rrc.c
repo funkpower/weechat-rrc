@@ -661,6 +661,18 @@ rrc_session_data(struct rrc_session *s, const uint8_t *data, size_t len, double 
     case RRC_T_MSG:
     case RRC_T_ACTION:
     case RRC_T_NOTICE:
+        /* A busy room's JOINED carries a member list too big for one packet,
+         * and rrcd then never sends it. Traffic for a room we asked to join
+         * means we are in it. */
+        if (ev.room && pending_take(s->pending_join, ev.room)) {
+            struct rrc_event joined;
+            memset(&joined, 0, sizeof(joined));
+            joined.type = RRC_EV_JOINED;
+            joined.room = ev.room;
+            joined.own = 1;
+            joined.ts = ev.ts;
+            s->cb.event(s->ctx, &joined);
+        }
         if (!body || body->type != CB_TEXT)
             return;
         if (ev.own && id && id->type == CB_BYTES && id->len == 8 && was_sent(s, id->p))
