@@ -4,6 +4,8 @@ A native WeeChat plugin, written in C, for [Reticulum Relay Chat](https://rrc.kc
 (RRC): IRC-style rooms on hubs reached over the [Reticulum](https://reticulum.network/)
 network.
 
+![weechat-rrc connected to the Permanet Chat hub over I2P](docs/screenshot.png)
+
 Reticulum support is built in. The plugin implements the parts an RRC client needs
 (identities, announce validation, path requests, links with their handshake, encryption,
 identify and keepalive), so it needs no Python and no `rns` package. It connects to a
