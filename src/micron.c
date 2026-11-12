@@ -116,7 +116,7 @@ micron_present(const char *in)
     int is_bg, index;
 
     for (p = strstr(in, BROKEN_BAR); p; p = strstr(p + 2, BROKEN_BAR))
-        if (colour_tag(p + 2, &is_bg, &index) || strchr("fb!*_", p[2]))
+        if (colour_tag(p + 2, &is_bg, &index) || (p[2] && strchr("fb!*_", p[2])))
             return 1;
     return raw_colour_present(in);
 }

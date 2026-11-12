@@ -250,6 +250,7 @@ test_micron(void)
           && strstr(out, "x<reset>") != NULL, "24-bit colour");
     CHECK(micron_render("\xc2\xa6" "Bzzz", out, sizeof(out), fake_color) == 0, "bad hex is text");
     CHECK(micron_present("a \xc2\xa6" "F123 b") && !micron_present("a `b` c"), "presence");
+    CHECK(!micron_present("ends in a lone \xc2\xa6"), "a trailing broken bar is not Micron");
     {
         char small[12];
         micron_render("\xc2\xa6" "Bf00\xe2\x96\x88\xe2\x96\x88\xe2\x96\x88", small, sizeof(small), fake_color);
