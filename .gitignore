@@ -1,0 +1,5 @@
+*.o
+*.so
+tests/test_unit
+tests/rrc-cli
+tests/fuzz
