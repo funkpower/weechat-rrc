@@ -19,6 +19,7 @@
 
 #include <weechat-plugin.h>
 
+#include "crypto.h"
 #include "hdlc.h"
 #include "micron.h"
 #include "rns.h"
@@ -81,6 +82,7 @@ struct rrc_server {
     int session_live;
     int welcomed;
     char hub_name[RRC_MAX_NICK];
+    uint8_t hub_identity[RNS_HASH_LEN];   /* who the hub's own notices come from */
 
     int close_pending;          /* the link closed inside a callback */
     char close_reason[160];
@@ -571,9 +573,15 @@ server_buffer_open(struct rrc_server *s)
         return;
     snprintf(name, sizeof(name), "server.%s", s->name);
     s->buffer = weechat_buffer_search(RRC_CONFIG_NAME, name);
-    if (!s->buffer)
+    if (s->buffer) {
+        /* a buffer kept by /upgrade has no callbacks: without them its input
+         * is refused and closing it would leave a dangling pointer here */
+        weechat_buffer_set_pointer(s->buffer, "input_callback", &server_input_cb);
+        weechat_buffer_set_pointer(s->buffer, "close_callback", &server_close_cb);
+    } else {
         s->buffer = weechat_buffer_new(name, &server_input_cb, NULL, NULL,
                                        &server_close_cb, NULL, NULL);
+    }
     if (!s->buffer)
         return;
     weechat_buffer_set(s->buffer, "short_name", s->name);
@@ -602,9 +610,13 @@ room_open(struct rrc_server *s, const char *room, int switch_to)
     if (!r->buffer) {
         snprintf(name, sizeof(name), "%s.%s", s->name, room);
         r->buffer = weechat_buffer_search(RRC_CONFIG_NAME, name);
-        if (!r->buffer)
+        if (r->buffer) {
+            weechat_buffer_set_pointer(r->buffer, "input_callback", &room_input_cb);
+            weechat_buffer_set_pointer(r->buffer, "close_callback", &room_close_cb);
+        } else {
             r->buffer = weechat_buffer_new(name, &room_input_cb, NULL, NULL,
                                            &room_close_cb, NULL, NULL);
+        }
         if (!r->buffer)
             return r;
         weechat_buffer_set(r->buffer, "short_name", room);
@@ -744,13 +756,17 @@ link_state_cb(void *ctx, enum rns_state state, const char *reason)
         server_print(s, "network", "path to the hub found (%d hop%s), opening a link",
                      s->link->hops, s->link->hops == 1 ? "" : "s");
         break;
-    case RNS_ACTIVE:
+    case RNS_ACTIVE: {
+        uint8_t full[32];
+        cr_sha256(s->link->dest_pub, RNS_PUBKEY_LEN, full);
+        memcpy(s->hub_identity, full, RNS_HASH_LEN);
         server_print(s, "network", "link established (round trip %.0f ms)",
                      s->link->rtt * 1000.0);
         rns_client_identify(s->link, now);
         rrc_session_start(&s->session, s->link->rtt, now);
         s->session_live = 1;
         break;
+    }
     case RNS_CLOSED:
         s->close_pending = 1;
         snprintf(s->close_reason, sizeof(s->close_reason), "%s",
@@ -949,7 +965,7 @@ session_event_cb(void *ctx, const struct rrc_event *ev)
 {
     struct rrc_server *s = ctx;
     struct rrc_room *r = ev->room ? room_find(s, ev->room) : NULL;
-    char name[RRC_MAX_NICK], prefix[64];
+    char name[RRC_MAX_NICK], prefix[256];
     size_t i;
 
     switch (ev->type) {
@@ -1029,15 +1045,34 @@ session_event_cb(void *ctx, const struct rrc_event *ev)
         break;
 
     case RRC_EV_NOTICE:
+        if (!ev->src || memcmp(ev->src, s->hub_identity, RNS_HASH_LEN) != 0) {
+            /* from a person, relayed by the hub: say who, and never read it
+             * as the hub's own word (topic, member list) */
+            char *color;
+            sender_name(r, ev, name, sizeof(name));
+            color = nick_color(name);
+            snprintf(prefix, sizeof(prefix), "%s-%s%s%s-\t", weechat_prefix("network"),
+                     color ? color : "", name, weechat_color("reset"));
+            free(color);
+            print_lines(r && r->buffer ? r->buffer : s->buffer, "rrc_notice,notify_message,log1",
+                        prefix, ev->text);
+            break;
+        }
         if (handle_who_notice(s, ev->text))
             break;
         handle_topic_notice(s, ev->text);
         snprintf(prefix, sizeof(prefix), "%s", weechat_prefix("network"));
-        print_lines(r && r->buffer ? r->buffer : s->buffer, "rrc_notice,notify_message,log3",
-                    prefix, ev->text);
+        print_lines(r && r->buffer ? r->buffer : s->buffer,
+                    r ? "rrc_notice,notify_none,log3" : "rrc_notice,log3", prefix, ev->text);
         break;
 
     case RRC_EV_ERROR:
+        /* a refused JOIN, or "kicked from ROOM" (rrcd sends no PARTED then):
+         * either way we are not in the room */
+        if (r && (ev->own || strncmp(ev->text, "kicked", 6) == 0)) {
+            r->joined = 0;
+            members_clear(r);
+        }
         print_lines(r && r->buffer ? r->buffer : s->buffer, "rrc_error,log3",
                     weechat_prefix("error"), ev->text);
         break;
@@ -1082,8 +1117,10 @@ read_cb(const void *pointer, void *data, int fd)
     struct rrc_server *s = (struct rrc_server *)pointer;
     uint8_t buf[8192];
     ssize_t n;
+    int reads;
 
-    for (;;) {
+    /* at most 32 reads per wakeup, so a flood can't hold WeeChat's main loop */
+    for (reads = 0; reads < 32; reads++) {
         n = read(fd, buf, sizeof(buf));
         if (n > 0) {
             hdlc_rx_feed(&s->rx, buf, (size_t)n, &on_frame_cb, s);
@@ -1194,7 +1231,7 @@ server_connect(struct rrc_server *s)
             server_print(s, "error", "bad unix socket name in %s", address);
             return -1;
         }
-        fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
         memset(&sa, 0, sizeof(sa));
         sa.sun_family = AF_UNIX;
         memcpy(sa.sun_path + 1, "rns/", 4);   /* abstract: "\0rns/NAME" */

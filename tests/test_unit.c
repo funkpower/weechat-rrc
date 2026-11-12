@@ -5,6 +5,7 @@
  * SPDX-License-Identifier: GPL-3.0-or-later
  */
 
+#include <locale.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -181,6 +182,11 @@ test_text(void)
 
     rrc_clean_text(in, sizeof(in), out, sizeof(out));
     CHECK(strcmp(out, "a[31m4b\xef\xbf\xbd" "c\xe2\x96\x88 \n") == 0, "clean text");
+    {
+        static const uint8_t rlo[] = { 'a', 0xe2, 0x80, 0xae, 'b' };
+        rrc_clean_text(rlo, sizeof(rlo), out, sizeof(out));
+        CHECK(strcmp(out, "ab") == 0, "bidi override stripped");
+    }
     CHECK(rrc_normalize_room("  LoBBy ", out, sizeof(out)) == 5 && strcmp(out, "lobby") == 0,
           "normalize room");
     CHECK(rrc_normalize_room("   ", out, sizeof(out)) == 0, "empty room");
@@ -249,9 +255,22 @@ test_micron(void)
     }
 }
 
+static void
+test_unicode_room(void)
+{
+    char out[64];
+
+    setlocale(LC_CTYPE, "C.UTF-8");
+    CHECK(rrc_normalize_room(" \xc3\x84rger ", out, sizeof(out)) && strcmp(out, "\xc3\xa4rger") == 0,
+          "non-ASCII room lowered like Python");
+    CHECK(rrc_normalize_room("\xd0\x9b\xd0\x9e\xd0\x91\xd0\x91\xd0\x98", out, sizeof(out))
+          && strcmp(out, "\xd0\xbb\xd0\xbe\xd0\xb1\xd0\xb1\xd0\xb8") == 0, "Cyrillic room");
+}
+
 int
 main(void)
 {
+    test_unicode_room();
     test_micron();
     test_keepalive_not_deduplicated();
     test_identity();

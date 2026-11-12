@@ -8,7 +8,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <limits.h>
 #include <time.h>
+#include <wchar.h>
+#include <wctype.h>
 
 #include "cbor.h"
 #include "crypto.h"
@@ -80,6 +83,8 @@ rrc_clean_text(const uint8_t *in, size_t len, char *out, size_t out_size)
                 i += n;
                 if (cp >= 0x80 && cp <= 0x9f)
                     continue;   /* C1 controls */
+                if ((cp >= 0x202a && cp <= 0x202e) || (cp >= 0x2066 && cp <= 0x2069))
+                    continue;   /* bidi overrides and isolates: they reorder the line */
                 if (o + n >= out_size)
                     break;
                 memcpy(out + o, in + i - n, n);
@@ -101,7 +106,11 @@ rrc_clean_text(const uint8_t *in, size_t len, char *out, size_t out_size)
 size_t
 rrc_normalize_room(const char *in, char *out, size_t out_size)
 {
-    size_t start = 0, end = strlen(in), i, n;
+    size_t start = 0, end = strlen(in), i, n, o = 0, k;
+    wchar_t wc;
+    mbstate_t st;
+    char mb[MB_LEN_MAX];
+    size_t len;
 
     while (start < end && (in[start] == ' ' || in[start] == '\t'))
         start++;
@@ -110,12 +119,54 @@ rrc_normalize_room(const char *in, char *out, size_t out_size)
     n = end - start;
     if (n == 0 || n >= out_size)
         return 0;
-    for (i = 0; i < n; i++) {
-        char ch = in[start + i];
-        out[i] = (ch >= 'A' && ch <= 'Z') ? (char)(ch - 'A' + 'a') : ch;
+    /* lower case like rrcd's Python str.lower(): ASCII directly, other
+     * characters through the C library (WeeChat runs in the user's UTF-8
+     * locale); anything it can't decode is copied as is */
+    memset(&st, 0, sizeof(st));
+    for (i = 0; i < n;) {
+        unsigned char ch = (unsigned char)in[start + i];
+        if (ch < 0x80) {
+            out[o++] = (ch >= 'A' && ch <= 'Z') ? (char)(ch - 'A' + 'a') : (char)ch;
+            i++;
+            continue;
+        }
+        len = mbrtowc(&wc, in + start + i, n - i, &st);
+        if (len == (size_t)-1 || len == (size_t)-2 || len == 0) {
+            memset(&st, 0, sizeof(st));
+            out[o++] = (char)ch;
+            i++;
+            continue;
+        }
+        k = wcrtomb(mb, (wchar_t)towlower((wint_t)wc), &st);
+        if (k == (size_t)-1 || o + k >= out_size) {
+            memcpy(out + o, in + start + i, len);
+            o += len;
+        } else {
+            memcpy(out + o, mb, k);
+            o += k;
+        }
+        i += len;
     }
-    out[n] = '\0';
-    return n;
+    if (o >= out_size)
+        return 0;
+    out[o] = '\0';
+    return o;
+}
+
+static void item_text(const struct cb_item *it, char *out, size_t out_size);
+#define item_text_any item_text
+
+/* Text for a one-line field (nick, room, hub name): a newline there could
+ * forge a whole display line, so it becomes a space. */
+static void
+item_line(const struct cb_item *it, char *out, size_t out_size)
+{
+    char *p;
+
+    item_text_any(it, out, out_size);
+    for (p = out; *p; p++)
+        if (*p == '\n')
+            *p = ' ';
 }
 
 static void
@@ -600,12 +651,12 @@ rrc_session_data(struct rrc_session *s, const uint8_t *data, size_t len, double 
         ev.src = src->p;
     if (room && room->type == CB_TEXT) {
         char raw[RRC_MAX_ROOM];
-        item_text(room, raw, sizeof(raw));
+        item_line(room, raw, sizeof(raw));
         if (rrc_normalize_room(raw, room_s, sizeof(room_s)))
             ev.room = room_s;
     }
     if (nick && nick->type == CB_TEXT) {
-        item_text(nick, nick_s, sizeof(nick_s));
+        item_line(nick, nick_s, sizeof(nick_s));
         if (nick_s[0])
             ev.nick = nick_s;
     }
@@ -619,8 +670,8 @@ rrc_session_data(struct rrc_session *s, const uint8_t *data, size_t len, double 
         s->hello_tries = 0;
         if (body && body->type == CB_MAP) {
             const struct cb_item *lim = cb_map_uint(body, B_WELCOME_LIMITS);
-            item_text(cb_map_uint(body, B_WELCOME_HUB), hub_s, sizeof(hub_s));
-            item_text(cb_map_uint(body, B_WELCOME_VER), ver_s, sizeof(ver_s));
+            item_line(cb_map_uint(body, B_WELCOME_HUB), hub_s, sizeof(hub_s));
+            item_line(cb_map_uint(body, B_WELCOME_VER), ver_s, sizeof(ver_s));
             if (hub_s[0])
                 ev.hub_name = hub_s;
             if (ver_s[0])
