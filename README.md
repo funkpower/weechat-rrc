@@ -108,6 +108,10 @@ make check          # optional: the unit tests
 make install        # into ~/.local/share/weechat/plugins
 ```
 
+`make install` also installs a small Python script, `rrc_autobuild.py`, that rebuilds the plugin
+after a WeeChat upgrade (see [After a WeeChat upgrade](#after-a-weechat-upgrade)). If your
+WeeChat keeps its files somewhere else, pass `PLUGIN_DIR=<weechat data dir>/plugins`.
+
 ### 5. Join Permanet Chat
 
 Start `weechat`, then:
@@ -137,10 +141,43 @@ use elsewhere, and never share the identity file (see [Identity](#identity-and-p
 cd weechat-rrc && git pull && make && make install
 ```
 
-then `/plugin reload rrc` in WeeChat. Rebuild after upgrading WeeChat too, since the plugin is
-built against its plugin API. Install with `make install`, not by copying over the old
+then `/plugin reload rrc` in WeeChat. Install with `make install`, not by copying over the old
 `rrc.so`: WeeChat keeps the loaded file mapped, and overwriting it in place crashes the next
 reload.
+
+## After a WeeChat upgrade
+
+WeeChat loads a plugin only if it was built for the running WeeChat's plugin API, and most
+WeeChat releases change it. After an upgrade, or an `/upgrade` into a new version, the core
+buffer shows
+
+```
+API mismatch for plugin ".../plugins/rrc.so" (current API: "...", plugin API: "..."), failed to load
+```
+
+and the RRC buffers that stayed open answer every line with
+`You cannot write text in this buffer`.
+
+`rrc_autobuild.py` fixes this by itself: about a second after WeeChat starts (or after
+`/upgrade`) it sees that `rrc` did not load, rebuilds it from the checkout `make install` ran
+from, loads it, and servers set to autoconnect join their rooms again. The core buffer says what it did, and shows the last
+lines of the build if the build fails. It only acts when `rrc.so` is installed and
+`weechat.plugin.autoload` allows `rrc`.
+
+| Option (`plugins.var.python.rrc_autobuild.*`) | Default | Meaning |
+|---|---|---|
+| `enabled` | `on` | `off` stops it |
+| `source_dir` | empty | checkout to rebuild from; empty means the one `make install` ran from |
+
+By hand, it is the same as:
+
+```sh
+cd weechat-rrc && make && make install
+```
+
+then `/plugin load rrc`. The build needs the WeeChat headers (`weechat-dev` / `weechat-devel`)
+from the same version as the running WeeChat; if they are older, the rebuilt plugin is refused
+the same way, so upgrade them together.
 
 ## Where Reticulum is reached
 
